@@ -1,0 +1,6 @@
+.idea/
+data/
+my_schema_pruner_model/
+*.csv
+*.jsonl
+*.json
