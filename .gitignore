@@ -1,5 +1,7 @@
 .idea/
 data/
+similarity_cache/
+models/
 my_schema_pruner_model/
 *.csv
 *.jsonl
