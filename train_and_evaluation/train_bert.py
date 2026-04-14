@@ -2,14 +2,19 @@ from sentence_transformers import CrossEncoder, InputExample
 from torch.utils.data import DataLoader
 import json
 import torch
+from pathlib import Path
 
 TRAIN_FILE = "cross_encoder_train_data.json"
 MODEL_SAVE_PATH = "./my_schema_pruner_model"
+BASE_DIR = Path(__file__).parent.parent
+
+LOCAL_MODEL_PATH = str(BASE_DIR / "models" / "bert-base-chinese")
 
 
 def train():
     # 1. 加载模型
-    model = CrossEncoder('bert-base-chinese', num_labels=1, max_length=128)
+    print(f"正在从本地加载模型: {LOCAL_MODEL_PATH}")
+    model = CrossEncoder(LOCAL_MODEL_PATH, num_labels=1, max_length=128)
 
     # 2. 读取切分好的训练数据
     with open(TRAIN_FILE, 'r', encoding='utf-8') as f:
