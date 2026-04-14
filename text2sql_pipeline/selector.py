@@ -18,7 +18,7 @@ class SQLSelector:
         if not valid_candidates:
             reason = "所有路径均执行失败或结果为空"
             # 即使失败也要返回 (结果, 理由)，防止 main2.py 报错
-            return (candidates[0] if candidates else None), reason
+            return (candidates[0] if candidates else None), reason, "failed"
 
         # 2. 统计逻辑：将执行结果转为字符串作为 Key 进行归类 
         result_groups = {}

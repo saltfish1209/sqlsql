@@ -131,39 +131,23 @@ class XiYanSQLSystem:
             print(f"实体提取严重错误: {e}")
             return []
 
-
-
     async def run_pipeline_async(self, question):
         start_time = time.time()  # 1. 记录开始时间
         tracker = TokenTracker()
 
         question = to_halfwidth(question)
 
-
-        debug_print(f">>> [Schema Pruning] 正在使用 BERT 检索 Top-20 相关列...")
-
-        # 1. 调用 similarity2.py 中已有的方法，利用 CrossEncoder 计算语义相似度
-        # 这会返回一个列名列表，例如 ['project_name', 'material_code', ...]
-        bert_top_cols = self.sim_engine.retrieve_schema_by_question_only(question, top_k=20)
-
-        # 2. 将列名列表转换为 M-Schema 文本格式
-        # 这一步非常重要，因为 LLM 需要看到类型和描述才能判断实体
-        lite_schema_text = self.generator.build_m_schema_prompt(
-            bert_top_cols,
-            self.sim_engine.column_metadata,
-            table_name="procurement_table"
-        )
-
-        # 打印一下看看效果 (调试用)
-        # debug_print(f"精简 Schema 内容:\n{lite_schema_text}")
-
+        # 【修复点】：移除提前使用 BERT 精简 Schema 的代码
+        # 直接使用全量 Schema 提取实体，确保 LLM 拥有全局视野
+        print(f">>> [Entity Extraction] 正在使用全量 Schema 提取实体...")
 
         # Step 1 : 实体提取(Async)
-        entities = await self.extract_entities_mock(question,schema_text=lite_schema_text,tracker = tracker)
+        # 不传入 schema_text 参数，extract_entities_mock 会自动使用 __init__ 中加载的全量 self.schema_text
+        entities = await self.extract_entities_mock(question, tracker=tracker)
         print(f">>> 提取实体: {entities}")
 
-
-        # Step 1.2 混合召回 (BERT + 精准匹配)
+        # Step 1.2 混合召回 (BERT + 精准匹配 + LSH)
+        # hybrid_retrieve 会在内部对全量列进行计算，返回最高分的列
         ranked_tuples, must_have_set, evidence_details = self.sim_engine.hybrid_retrieve(question, entities)
         full_ranked_list = [x[0] for x in ranked_tuples]
 
@@ -172,13 +156,14 @@ class XiYanSQLSystem:
         print(f">>> 尝试第一梯队: {top_20_cols}")
 
         # Step 1.3: 执行流程 (Async)
-        best_cand = await self._try_execute_flow_async(question, top_20_cols, entities,tracker)
+        # 在 _try_execute_flow_async 内部，才会真正把 top_20_cols 组装成精简 m_schema 喂给生成器
+        best_cand = await self._try_execute_flow_async(question, top_20_cols, entities, tracker)
 
         # 如果第一梯队失败，尝试第二梯队 (Top 20-40)
         if not best_cand or best_cand.get('status') != 'success':
             print(">>> [Fallback] 第一梯队失败，尝试 20-40 列...")
             top_20_40_cols = list(set(full_ranked_list[20:40]) | must_have_set)
-            best_cand = await self._try_execute_flow_async(question, top_20_40_cols, entities,tracker)
+            best_cand = await self._try_execute_flow_async(question, top_20_40_cols, entities, tracker)
 
         # 2. 计算总耗时
         total_time = time.time() - start_time

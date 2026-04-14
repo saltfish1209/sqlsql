@@ -19,7 +19,7 @@ class SQLRefiner:
         self.model = model
 
 
-    async def refine_async(self, question, schema_prompt, candidates,all_valid_columns,max_retries=2):
+    async def refine_async(self, question, schema_prompt, candidates,all_valid_columns,token_tracker,max_retries=2):
         """
         对候选 SQL 进行执行检查和修正。
         """
@@ -43,7 +43,7 @@ class SQLRefiner:
         print(f">>> 启动异步修正，需修复数量: {len(retry_tasks)}")
 
         tasks = [
-            self._repair_worker(question, schema_prompt, cand, all_valid_columns, max_retries)
+            self._repair_worker(question, schema_prompt, cand, all_valid_columns,token_tracker, max_retries)
             for cand in retry_tasks
         ]
 
@@ -52,7 +52,7 @@ class SQLRefiner:
 
         return refined_candidates
 
-    async def _repair_worker(self, question, schema_prompt, cand, valid_cols, max_retries):
+    async def _repair_worker(self, question, schema_prompt, cand, valid_cols, token_tracker,max_retries):
         """单个候选 SQL 的多轮修复逻辑"""
         current_sql = cand['sql']
         current_error = cand['error_msg']
@@ -93,6 +93,7 @@ class SQLRefiner:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.01
                 )
+                token_tracker.track(resp)
                 content = resp.choices[0].message.content
 
                 # 调用 Generator 的静态方法清洗 SQL

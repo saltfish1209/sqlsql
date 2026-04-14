@@ -307,14 +307,14 @@ class Similarity:
         for col_dict in evidence_details["fuzzy_matches"].values():
             all_candidate_cols.update(col_dict.keys())
 
-        # A路结果（用于 SELECT 列）
-        all_col_metas = self.column_metadata
-        pairs = [[question, col['column_description']] for col in all_col_metas]
-        scores = self.bert_ranker.predict(pairs)
-        ranked_results = sorted(
-            zip([c['column_name'] for c in all_col_metas], scores),
-            key=lambda x: x[1], reverse=True
-        )
+        # # A路结果（用于 SELECT 列）
+        # all_col_metas = self.column_metadata
+        # pairs = [[question, col['column_description']] for col in all_col_metas]
+        # scores = self.bert_ranker.predict(pairs)
+        # ranked_results = sorted(
+        #     zip([c['column_name'] for c in all_col_metas], scores),
+        #     key=lambda x: x[1], reverse=True
+        # )
 
         return ranked_results, all_candidate_cols, evidence_details
 
