@@ -1,0 +1,6 @@
+/data
+/models
+*.json
+*.jsonl
+*.csv
+*.txt
