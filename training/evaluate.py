@@ -83,6 +83,10 @@ async def main():
     correct = 0
     total = len(df)
     logs = []
+    sum_first_infer = 0.0
+    sum_total = 0.0
+    sum_repair_each = 0.0
+    repair_rounds = 0
 
     for idx, row in df.iterrows():
         question = str(row["生成问题"]).strip()
@@ -93,6 +97,13 @@ async def main():
         try:
             output = await system.run_pipeline(question)
             dt = time.time() - t0
+            first_infer = float(output.get("first_inference_time", 0.0) or 0.0)
+            total_cost = float(output.get("cost_time", dt) or dt)
+            repair_times = output.get("repair_times", []) or []
+            sum_first_infer += first_infer
+            sum_total += total_cost
+            sum_repair_each += sum(repair_times)
+            repair_rounds += len(repair_times)
             gt_set = parse_ground_truth(raw_gt)
             pred_set = normalize_execution_result(output.get("execution_result"))
             ok = gt_set == pred_set
@@ -103,9 +114,9 @@ async def main():
                 print(f"  SQL: {output.get('final_sql')}")
                 print(f"  GT:  {gt_set}")
                 print(f"  Pred:{pred_set}")
-                print(f"  {icon} | {dt:.2f}s")
+                print(f"  {icon} | total={total_cost:.2f}s | first_infer={first_infer:.2f}s | repairs={repair_times}")
             else:
-                print(f"[{idx+1}/{total}] {icon} {dt:.2f}s")
+                print(f"[{idx+1}/{total}] {icon} total={total_cost:.2f}s first_infer={first_infer:.2f}s repairs={repair_times}")
             logs.append({
                 "id": idx, "question": question,
                 "sql": output.get("final_sql"),
@@ -123,6 +134,12 @@ async def main():
     acc = correct / total if total else 0
     print(f"\n{'='*50}")
     print(f"最终准确率: {acc:.2%} ({correct}/{total})")
+    avg_first_infer = sum_first_infer / total if total else 0.0
+    avg_total = sum_total / total if total else 0.0
+    avg_repair_each = sum_repair_each / repair_rounds if repair_rounds else 0.0
+    print(f"平均首次推理耗时: {avg_first_infer:.2f}s")
+    print(f"平均每次修正耗时: {avg_repair_each:.2f}s (共 {repair_rounds} 次修正)")
+    print(f"平均总耗时: {avg_total:.2f}s")
 
     err_logs = [l for l in logs if not l["is_correct"]]
     out_path = os.path.join(os.path.dirname(__file__), "error_analysis.json")

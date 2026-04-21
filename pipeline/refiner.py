@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from openai import AsyncOpenAI
 
@@ -98,8 +99,10 @@ class SQLRefiner:
         current_sql = cand["sql"]
         current_error = cand["error_msg"]
         valid_cols_str = ", ".join(valid_cols)
+        repair_times: list[float] = []
 
         for i in range(max_retries):
+            t_repair_start = time.time()
             system_msg = "你是 SQLite 修复专家。只输出修复后的 SQL，不要输出任何解释或其他内容。"
             user_msg = (
                 f"【Schema】\n{schema_prompt}\n"
@@ -128,6 +131,7 @@ class SQLRefiner:
                 fixed_sql = SQLGenerator.extract_sql(content)
 
                 result, error = self.db.execute_sql(fixed_sql)
+                repair_times.append(time.time() - t_repair_start)
                 if error is None and _is_meaningful(result):
                     debug_print(f"[Refiner] {cand['type']} 第{i+1}次修正成功")
                     return {
@@ -135,10 +139,12 @@ class SQLRefiner:
                         "sql": fixed_sql,
                         "status": "success",
                         "result": result,
+                        "repair_times": repair_times,
                     }
                 current_sql = fixed_sql
                 current_error = error or "Fixed SQL still returns empty."
             except Exception as e:
+                repair_times.append(time.time() - t_repair_start)
                 debug_print(f"[Refiner] 修复异常: {e}")
 
         return {
@@ -147,6 +153,7 @@ class SQLRefiner:
             "status": "failed",
             "error_msg": current_error,
             "result": None,
+            "repair_times": repair_times,
         }
 
     def _check_literals(self, sql: str) -> list[str]:

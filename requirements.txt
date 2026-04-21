@@ -1,0 +1,16 @@
+# question_to_sql 核心依赖
+openai>=1.0
+pandas>=2.0
+sentence-transformers>=3.0
+datasketch>=1.6
+torch>=2.0
+einops>=0.7
+
+# 训练 (可选)
+peft>=0.6
+trl>=0.7
+datasets>=2.14
+transformers>=4.42
+
+# vLLM 推理服务 (可选)
+# vllm>=0.4

@@ -119,6 +119,9 @@
           <mappings>
             <mapping deploy="/home/xs-a100/yj/nl2sql" local="$PROJECT_DIR$" web="/" />
           </mappings>
+          <excludedPaths>
+            <excludedPath path="/home/xs-a100/yj/nl2sql/models" />
+          </excludedPaths>
         </serverdata>
       </paths>
     </serverData>

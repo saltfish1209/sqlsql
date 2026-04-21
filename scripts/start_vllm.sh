@@ -11,6 +11,8 @@ MODEL_PATH="${VLLM_MODEL_PATH:-$PROJECT_ROOT/models/DeepSeek-Coder-V2-Lite-Instr
 SERVED_NAME="${LLM_MODEL:-DeepSeek-Coder-V2-Lite-Instruct}"
 PORT="${VLLM_PORT:-8000}"
 HOST_BIND="${VLLM_HOST:-0.0.0.0}"
+GPU_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.72}"
+MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-4}"
 
 if [[ ! -d "$MODEL_PATH" ]]; then
   echo "[WARN] 模型目录不存在: $MODEL_PATH" >&2
@@ -26,6 +28,8 @@ echo "  --model             = $MODEL_PATH"
 echo "  --served-model-name = $SERVED_NAME"
 echo "  --host              = $HOST_BIND"
 echo "  --port              = $PORT"
+echo "  --gpu-memory-util   = $GPU_MEM_UTIL"
+echo "  --max-num-seqs      = $MAX_NUM_SEQS"
 echo ""
 echo "在另一个终端执行: source scripts/set_env.sh"
 echo ""
@@ -34,4 +38,7 @@ python -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_PATH" \
   --served-model-name "$SERVED_NAME" \
   --host "$HOST_BIND" \
-  --port "$PORT"
+  --port "$PORT" \
+  --gpu-memory-utilization "$GPU_MEM_UTIL" \
+  --max-model-len "$MAX_MODEL_LEN" \
+  --max-num-seqs "$MAX_NUM_SEQS"

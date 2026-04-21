@@ -65,6 +65,8 @@ class TextToSQLSystem:
         tracker = TokenTracker()
         question = to_halfwidth(question)
         K = settings.top_k_embed
+        first_inference_time = 0.0
+        selected_repair_times: list[float] = []
 
         # Step 1: A路预排序（无实体），构建精简 Schema 用于实体提取
         debug_print("[Pipeline] A路预排序，构建精简 Schema...")
@@ -87,18 +89,25 @@ class TextToSQLSystem:
         tier1 = list(set(full_list[:K]) | must_have)
         debug_print(f"[Pipeline] 梯队1(Top {K}): {tier1}")
         best = await self._try_flow(question, tier1, entities, evidence, tracker)
+        if best:
+            first_inference_time = best.get("first_inference_time", 0.0)
+            selected_repair_times = best.get("repair_times", []) or []
 
         # 梯队 2: 扩展至 Top-2K（保留梯队1 + 新增列）
         if not best or best.get("status") != "success":
             tier2 = list(set(full_list[:K * 2]) | must_have)
             debug_print(f"[Pipeline] 梯队2 扩展至 Top {K*2}")
             best = await self._try_flow(question, tier2, entities, evidence, tracker)
+            if best:
+                selected_repair_times = best.get("repair_times", []) or []
 
         # 梯队 3: 全新列段 Top-2K+1 ~ 3K
         if not best or best.get("status") != "success":
             tier3 = list(set(full_list[K * 2:K * 3]) | must_have)
             debug_print(f"[Pipeline] 梯队3 兜底列")
             best = await self._try_flow(question, tier3, entities, evidence, tracker)
+            if best:
+                selected_repair_times = best.get("repair_times", []) or []
 
         total_time = time.time() - start
 
@@ -108,6 +117,8 @@ class TextToSQLSystem:
                 "execution_result": None,
                 "unique_rows_count": 0,
                 "reason": "all_paths_failed",
+                "first_inference_time": first_inference_time,
+                "repair_times": selected_repair_times,
                 "cost_time": total_time,
                 "token_usage": tracker.get_report(),
             }
@@ -125,6 +136,8 @@ class TextToSQLSystem:
             "execution_result": unique_rows if final_res else final_res,
             "unique_rows_count": unique_count,
             "reason": best.get("status", "success"),
+            "first_inference_time": first_inference_time,
+            "repair_times": selected_repair_times,
             "cost_time": total_time,
             "token_usage": tracker.get_report(),
         }
@@ -150,9 +163,11 @@ class TextToSQLSystem:
             profile_text=self._profile_text,
         )
 
+        gen_start = time.time()
         raw_cands = await self.generator.generate_candidates_async(
             question, m_schema, entities, evidence, tracker
         )
+        first_inference_time = time.time() - gen_start
         debug_print(f"[Pipeline] Generator 原始候选 ({len(raw_cands)}个)")
 
         refined = await self.refiner.refine_async(
@@ -168,9 +183,14 @@ class TextToSQLSystem:
             return None
         if status == "tie":
             debug_print("[Pipeline] 触发平票，按路径优先级决策")
-            return SQLRefiner.resolve_tie(selected)
+            resolved = SQLRefiner.resolve_tie(selected)
+            resolved["first_inference_time"] = first_inference_time
+            resolved["repair_times"] = resolved.get("repair_times", []) or []
+            return resolved
 
         debug_print(f"[Pipeline] 选择结果: {reason}")
+        selected["first_inference_time"] = first_inference_time
+        selected["repair_times"] = selected.get("repair_times", []) or []
         return selected
 
 
@@ -180,7 +200,7 @@ if __name__ == "__main__":
     system = TextToSQLSystem()
 
     test_questions = [
-        "协议库存可视化选购20230407"批次的采购实施模式是怎样的？",
+        "\"协议库存可视化选购20230407\"批次的采购实施模式是怎样的？",
     ]
 
     loop = asyncio.get_event_loop()

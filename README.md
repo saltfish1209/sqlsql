@@ -83,12 +83,12 @@ python scripts/profile_db.py
 
 ## 模型架构
 
-| 组件 | 模型 | 用途 |
-|---|---|---|
-| **Embedding (Bi-Encoder)** | `harrier-oss-v1-0.6b` | Schema 列描述语义嵌入、ICL 模板检索 |
-| **Reranker (Cross-Encoder)** | `jina-reranker-v3` | Schema Linking A路精排基座 |
+| 组件 | 模型                       | 用途 |
+|---|--------------------------|---|
+| **Embedding (Bi-Encoder)** | `harrier-oss-v1-0.6b`    | Schema 列描述语义嵌入、ICL 模板检索 |
+| **Reranker (Cross-Encoder)** | `jina-reranker-v3`       | Schema Linking A路精排基座 |
 | **Schema Pruner** | `my_schema_pruner_model` | 基于 jina-reranker-v3 微调的领域精排模型 |
-| **SQL 生成 LLM** | Qwen 系列 (vLLM) | 三路 SQL 生成、实体提取、修正 |
+| **SQL 生成 LLM** | 开源LLM (vLLM)             | 三路 SQL 生成、实体提取、修正 |
 
 ### Reranker 微调流程
 
