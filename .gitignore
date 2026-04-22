@@ -1,5 +1,9 @@
 /data
 /models
+/.specstory
+/.idea
+/.vscode
+/.ollama
 *.json
 *.jsonl
 *.csv

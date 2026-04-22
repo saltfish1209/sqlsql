@@ -16,6 +16,7 @@ import re
 import time
 
 import pandas as pd
+import torch
 from datasketch import MinHash, MinHashLSH
 from sentence_transformers import CrossEncoder
 
@@ -76,6 +77,14 @@ class SchemaLinker:
         self.bert_ranker = CrossEncoder(
             self._cross_encoder_path, trust_remote_code=True,
         )
+        if settings.debug_mode:
+            model_device = next(self.bert_ranker.model.parameters()).device
+            debug_print(f"[Schema] CrossEncoder device: {model_device}")
+            debug_print(
+                f"[Schema] torch.cuda.is_available(): {torch.cuda.is_available()}"
+            )
+            if torch.cuda.is_available():
+                debug_print(f"[Schema] GPU: {torch.cuda.get_device_name(0)}")
 
         if os.path.isfile(schema_path_or_text):
             with open(schema_path_or_text, "r", encoding="utf-8") as f:
@@ -218,8 +227,13 @@ class SchemaLinker:
                 debug_info["B_exact"].append((kw_clean, list(matched_cols)))
 
         # A路：CrossEncoder 精排
+        a_start = time.time()
         pairs = [[question, c["column_description"]] for c in self.column_metadata]
+        debug_print(f"[Schema][A-route] CrossEncoder 输入对数: {len(pairs)}")
         scores = self.bert_ranker.predict(pairs)
+        debug_print(
+            f"[Schema][A-route] CrossEncoder predict 耗时: {time.time() - a_start:.2f}s"
+        )
         ranked = sorted(
             zip([c["column_name"] for c in self.column_metadata], scores),
             key=lambda x: x[1],

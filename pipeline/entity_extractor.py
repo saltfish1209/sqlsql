@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from openai import AsyncOpenAI
 
+from config.settings import settings
 from pipeline.utils import debug_print, TokenTracker
 
 
@@ -72,6 +74,11 @@ class EntityExtractor:
 
         for attempt in range(max_retries):
             try:
+                call_start = time.time()
+                debug_print(
+                    f"[Entity] LLM 实体提取开始 (attempt={attempt + 1}/{max_retries}, "
+                    f"timeout={settings.llm_request_timeout_sec}s)"
+                )
                 resp = await self.client.chat.completions.create(
                     model=self.model,
                     messages=[
@@ -79,6 +86,10 @@ class EntityExtractor:
                         {"role": "user", "content": user_msg},
                     ],
                     temperature=0.01,
+                    timeout=settings.llm_request_timeout_sec,
+                )
+                debug_print(
+                    f"[Entity] LLM 实体提取完成，耗时 {time.time() - call_start:.2f}s"
                 )
                 if tracker:
                     tracker.track(resp)

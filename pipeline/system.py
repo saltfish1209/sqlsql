@@ -75,8 +75,13 @@ class TextToSQLSystem:
         entity_schema = self.linker.build_entity_schema(pre_top_cols)
 
         # Step 2: LLM + 规则联合实体提取
+        entity_start = time.time()
+        debug_print("[Pipeline] Step2 实体提取开始...")
         entities = await self.entity_extractor.extract(
             question, entity_schema, tracker
+        )
+        debug_print(
+            f"[Pipeline] Step2 实体提取完成，耗时 {time.time() - entity_start:.2f}s"
         )
 
         # Step 3: 带实体的完整混合召回

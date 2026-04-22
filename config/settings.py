@@ -96,6 +96,9 @@ class Settings:
     icl_temperature: float = 0.1
     direct_temperature: float = 0.0
     max_gen_tokens: int = 2048
+    llm_request_timeout_sec: int = field(
+        default_factory=lambda: int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "120"))
+    )
 
     # ── Refiner ──
     max_repair_retries: int = 2

@@ -40,5 +40,4 @@ python -m vllm.entrypoints.openai.api_server \
   --host "$HOST_BIND" \
   --port "$PORT" \
   --gpu-memory-utilization "$GPU_MEM_UTIL" \
-  --max-model-len "$MAX_MODEL_LEN" \
   --max-num-seqs "$MAX_NUM_SEQS"
