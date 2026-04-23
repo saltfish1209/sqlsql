@@ -18,7 +18,7 @@ if [[ "$LLM_PROVIDER" == "ollama" ]]; then
 else
   PORT="$VLLM_PORT"
   DEFAULT_BASE_URL="http://127.0.0.1:${PORT}/v1"
-  SERVED="${LLM_MODEL:-DeepSeek-Coder-V2-Lite-Instruct}"
+  SERVED="${LLM_MODEL:-Qwen3.5-9B}"
   DEFAULT_API_KEY="EMPTY"
 fi
 

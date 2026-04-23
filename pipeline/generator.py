@@ -17,7 +17,7 @@ import random
 import re
 
 import pandas as pd
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError
 from sentence_transformers import SentenceTransformer, util
 
 from config.settings import settings
@@ -163,8 +163,8 @@ class SQLGenerator:
             f"[Schema]\n{schema_prompt}\n"
             f"[数据库证据]\n{evidence_str}\n"
             f"[用户问题]\n{question}\n"
-            f"请务必先输出思考过程,请输出高质量SQL，用```sql ... ```包裹,不需要解释和输出其他内容。\n"
-            # f"/think"
+            f"请务必先输出思考过程，思考结束后**必须**输出高质量 SQL，"
+            f"用```sql ... ```包裹，不需要其他多余文本。\n"
         )
 
         examples = self._get_top_k_examples(question)
@@ -175,8 +175,7 @@ class SQLGenerator:
             f"[Schema]\n{schema_prompt}\n"
             f"[数据库证据]\n{evidence_str}\n"
             f"[用户问题]\n{question}\n"
-            f"请输出SQL，用```sql ... ```包裹，不需要解释和输出其他内容。\n"
-            # f"/no_think"
+            f"请直接输出SQL，用```sql ... ```包裹，不需要思考过程、解释或其他内容。\n"
         )
 
         direct_prompt = (
@@ -185,8 +184,7 @@ class SQLGenerator:
             f"[Schema]\n{schema_prompt}\n"
             f"[数据库证据]\n{evidence_str}\n"
             f"[用户问题]\n{question}\n"
-            f"请输出SQL，用```sql ... ```包裹，不需要解释和输出其他内容。\n"
-            # f"/no_think"
+            f"请直接输出SQL，用```sql ... ```包裹，不需要思考过程、解释或其他内容。\n"
         )
 
         tasks = []
@@ -205,19 +203,55 @@ class SQLGenerator:
         tracker: TokenTracker, temperature: float,
     ) -> dict | None:
         try:
-            resp = await self.client.chat.completions.create(
+            messages: list[dict] = [{"role": "user", "content": prompt}]
+            extra_body: dict = {}
+            prefix = ""
+
+            # 只有 thinking_path 启用 CoT，其余路径通过 chat_template_kwargs 关闭思考
+            is_thinking_path = (path_type == "thinking_path")
+            if not is_thinking_path:
+                extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+            if settings.generator_prefix_code_fence:
+                messages.append({"role": "assistant", "content": "```sql\n"})
+                extra_body["continue_final_message"] = True
+                extra_body["add_generation_prompt"] = False
+                prefix = "```sql\n"
+
+            # 构建请求：
+            #   thinking_path 不设 max_tokens 上限（让 CoT 充分展开）
+            #   非思考路径使用 settings.max_gen_tokens
+            create_kwargs: dict = dict(
                 model=self.model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=temperature,
-                max_tokens=settings.max_gen_tokens,
+                timeout=settings.llm_request_timeout_sec,
                 stream=False,
+                extra_body=extra_body or None,
             )
+            if is_thinking_path:
+                if settings.thinking_max_tokens > 0:
+                    create_kwargs["max_tokens"] = settings.thinking_max_tokens
+                # thinking_max_tokens == 0 时完全不传 max_tokens，交由 vLLM 上限决定
+            else:
+                create_kwargs["max_tokens"] = settings.max_gen_tokens
+
+            resp = await self.client.chat.completions.create(**create_kwargs)
             tracker.track(resp)
-            content = resp.choices[0].message.content
-            sql = self.extract_sql(content)
+            content = (resp.choices[0].message.content or "")
+            full_content = prefix + content
+            debug_print(f"[Generator][raw][{path_type}] {full_content!r}")
+            sql = self.extract_sql(full_content)
             if sql:
-                return {"type": path_type, "sql": sql, "raw_content": content}
+                return {"type": path_type, "sql": sql, "raw_content": full_content}
+            return None
+        except APIConnectionError as e:
+            base_url = str(getattr(self.client, "base_url", "") or "?")
+            print(
+                f"[Generator][FATAL] 无法连接 LLM 服务 "
+                f"(base_url={base_url}, model={self.model}, path={path_type}): {e}"
+            )
             return None
         except Exception as e:
-            debug_print(f"[Generator] 生成失败({path_type}): {e}")
+            debug_print(f"[Generator] 生成失败({path_type}): {type(e).__name__}: {e}")
             return None

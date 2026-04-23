@@ -7,7 +7,7 @@ import os
 import sqlite3
 import pandas as pd
 
-from pipeline.utils import to_halfwidth
+from pipeline.utils import to_halfwidth, debug_print
 
 
 class DBEngine:
@@ -26,7 +26,7 @@ class DBEngine:
         for col in str_cols:
             df[col] = df[col].apply(to_halfwidth)
         df.to_sql(self.table_name, self.conn, index=False, if_exists="replace")
-        print(f"[DB] 数据已加载，表名: {self.table_name}, 行数: {len(df)}")
+        debug_print(f"[DB] 数据已加载，表名: {self.table_name}, 行数: {len(df)}")
 
     @staticmethod
     def _extract_first_select(sql: str) -> str:

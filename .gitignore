@@ -4,7 +4,12 @@
 /.idea
 /.vscode
 /.ollama
+/.cursorrules
+/.claude
+/.cursor
+/superpowers-main
 *.json
 *.jsonl
 *.csv
+
 

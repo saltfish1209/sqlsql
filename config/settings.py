@@ -95,14 +95,60 @@ class Settings:
     thinking_temperature: float = 0.5
     icl_temperature: float = 0.1
     direct_temperature: float = 0.0
-    max_gen_tokens: int = 2048
+    # 非思考路径的 max_tokens：SQL 本身很短，1024 足够
+    max_gen_tokens: int = field(
+        default_factory=lambda: int(os.getenv("LLM_MAX_GEN_TOKENS", "1024"))
+    )
+    # thinking_path 的 max_tokens：设 0 表示不限（不向 API 传 max_tokens）
+    thinking_max_tokens: int = field(
+        default_factory=lambda: int(os.getenv("THINKING_MAX_TOKENS", "0"))
+    )
     llm_request_timeout_sec: int = field(
-        default_factory=lambda: int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "120"))
+        default_factory=lambda: int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "180"))
+    )
+    # 三路策略：
+    #   thinking_path 始终启用思考 (enable_thinking=True)
+    #   ICL / Direct 始终禁用思考 (enable_thinking=False)
+    # 通过 extra_body.chat_template_kwargs 传给 vLLM
+    enable_thinking_for_entity: bool = field(
+        default_factory=lambda: os.getenv("ENTITY_ENABLE_THINKING", "False").lower() == "true"
+    )
+    enable_thinking_for_refiner: bool = field(
+        default_factory=lambda: os.getenv("REFINER_ENABLE_THINKING", "False").lower() == "true"
+    )
+
+    # ── Entity Extraction ──
+    entity_max_tokens: int = field(
+        default_factory=lambda: int(os.getenv("ENTITY_MAX_TOKENS", "256"))
+    )
+    # vLLM guided decoding：extra_body.guided_json，强制输出 JSON 数组
+    entity_use_guided_json: bool = field(
+        default_factory=lambda: os.getenv("ENTITY_USE_GUIDED_JSON", "True").lower() == "true"
+    )
+    # 替模型开头：追加 assistant "[" + continue_final_message。
+    # 默认关闭：vLLM + Qwen3 + guided_json 同时启用时会出现 "]]" 等 schema 尾巴污染，
+    # 只用 guided_json 已经足够可靠。
+    entity_prefix_bracket: bool = field(
+        default_factory=lambda: os.getenv("ENTITY_PREFIX_BRACKET", "False").lower() == "true"
     )
 
     # ── Refiner ──
     max_repair_retries: int = 2
     refiner_temperature: float = 0.01
+    # Refiner 同样需要给 Qwen3 的 CoT 留空间
+    refiner_max_tokens: int = field(
+        default_factory=lambda: int(os.getenv("REFINER_MAX_TOKENS", "2048"))
+    )
+    # Refiner 不强制时间截停：max_tokens 已能自然限制生成长度
+    refiner_enforce_timeout: bool = field(
+        default_factory=lambda: os.getenv("REFINER_ENFORCE_TIMEOUT", "False").lower() == "true"
+    )
+
+    # ── SQL Generator 可选的 assistant 前缀（默认关闭） ──
+    # 若开启：以 "```sql\n" 预填，强迫模型从 SQL 字面起笔
+    generator_prefix_code_fence: bool = field(
+        default_factory=lambda: os.getenv("GEN_PREFIX_CODE_FENCE", "False").lower() == "true"
+    )
 
     # ── Profiler (论文新增) ──
     profile_sample_rows: int = 50

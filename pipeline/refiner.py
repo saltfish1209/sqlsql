@@ -14,8 +14,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections import Counter
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError
 
 from config.settings import settings
 from pipeline.db_engine import DBEngine
@@ -23,10 +24,23 @@ from pipeline.generator import SQLGenerator
 from pipeline.utils import debug_print, TokenTracker
 
 
-def _is_meaningful(result) -> bool:
-    if not result or len(result) == 0:
+def _result_key(result) -> str:
+    """把执行结果折叠成可哈希的字符串键，用于多路投票一致性比较。"""
+    if result is None:
+        return "<NONE>"
+    try:
+        # 归一化：顺序不同但集合相同也视作一致
+        return str(sorted([tuple(r) for r in result]))
+    except Exception:
+        return str(result)
+
+
+def _majority_agreed(successful: list[dict]) -> bool:
+    """至少两路成功且存在一对结果完全一致，则投票已锁定。"""
+    if len(successful) < 2:
         return False
-    return any(val is not None for val in result[0])
+    counts = Counter(_result_key(c.get("result")) for c in successful)
+    return max(counts.values()) >= 2
 
 
 def _extract_where_literals(sql: str) -> list[tuple[str, str]]:
@@ -61,21 +75,30 @@ class SQLRefiner:
 
         for cand in candidates:
             result, error = self.db.execute_sql(cand["sql"])
-            if error is None and result:
-                # Literal-Column 校验
-                literal_issues = self._check_literals(cand["sql"])
-                if literal_issues:
-                    cand["error_msg"] = f"LITERAL_MISMATCH: {literal_issues}"
-                    need_repair.append(cand)
-                else:
-                    cand["status"] = "success"
-                    cand["result"] = result
-                    refined.append(cand)
-            else:
-                cand["error_msg"] = error or "Execution returned empty result."
+            if error is not None:
+                cand["error_msg"] = error
                 need_repair.append(cand)
+                continue
+            # 执行成功：即便结果为空或 NULL 也视为合法业务结果，不再算运行错误。
+            # 仅当 WHERE 字面量确实与列不匹配时，才进入修复（改 LIKE）。
+            literal_issues = self._check_literals(cand["sql"]) if result else []
+            if literal_issues:
+                cand["error_msg"] = f"LITERAL_MISMATCH: {literal_issues}"
+                need_repair.append(cand)
+            else:
+                cand["status"] = "success"
+                cand["result"] = result if result is not None else []
+                refined.append(cand)
 
         if not need_repair:
+            return refined
+
+        # 早停：按投票一致性，若已有两路成功且结果一致，
+        # 无论剩余路是否出错都不再修复——第三路正确与否不影响多数票。
+        if _majority_agreed(refined):
+            debug_print(
+                f"[Refiner] 已有 {len(refined)} 路结果一致，跳过 {len(need_repair)} 个修复任务"
+            )
             return refined
 
         debug_print(f"[Refiner] 启动修正，需修复: {len(need_repair)} 个")
@@ -115,37 +138,55 @@ class SQLRefiner:
                 f"2. 结果为空时将 '=' 改为 'LIKE'。\n"
                 f"3. 如果字面量不存在于该列，使用 LIKE '%关键词%' 替代精确匹配。\n"
                 f"4. 补全不完整的 SELECT-FROM-WHERE 结构。\n"
-                f"SQL:"
+                f"直接输出修复后的 SQL，用```sql ... ```包裹，不要思考过程。"
             )
             try:
-                resp = await self.client.chat.completions.create(
+                extra_body: dict = {}
+                if not settings.enable_thinking_for_refiner:
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+                create_kwargs = dict(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_msg},
                     ],
                     temperature=settings.refiner_temperature,
+                    max_tokens=settings.refiner_max_tokens,
+                    extra_body=extra_body or None,
                 )
+                if settings.refiner_enforce_timeout:
+                    create_kwargs["timeout"] = settings.llm_request_timeout_sec
+                resp = await self.client.chat.completions.create(**create_kwargs)
                 tracker.track(resp)
                 content = resp.choices[0].message.content
+                debug_print(f"[Refiner][raw][{cand['type']}] {content!r}")
                 fixed_sql = SQLGenerator.extract_sql(content)
 
                 result, error = self.db.execute_sql(fixed_sql)
                 repair_times.append(time.time() - t_repair_start)
-                if error is None and _is_meaningful(result):
+                # 修复后只要无执行错误即接受（空结果 / NULL 均视为合法业务结果）
+                if error is None:
                     debug_print(f"[Refiner] {cand['type']} 第{i+1}次修正成功")
                     return {
                         "type": f"{cand['type']}_Refined_{i + 1}",
                         "sql": fixed_sql,
                         "status": "success",
-                        "result": result,
+                        "result": result if result is not None else [],
                         "repair_times": repair_times,
                     }
                 current_sql = fixed_sql
-                current_error = error or "Fixed SQL still returns empty."
+                current_error = error
+            except APIConnectionError as e:
+                repair_times.append(time.time() - t_repair_start)
+                base_url = str(getattr(self.client, "base_url", "") or "?")
+                print(
+                    f"[Refiner][FATAL] 无法连接 LLM 服务 "
+                    f"(base_url={base_url}, model={self.model}): {e}"
+                )
+                break
             except Exception as e:
                 repair_times.append(time.time() - t_repair_start)
-                debug_print(f"[Refiner] 修复异常: {e}")
+                debug_print(f"[Refiner] 修复异常: {type(e).__name__}: {e}")
 
         return {
             "type": cand["type"],

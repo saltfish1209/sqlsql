@@ -121,6 +121,10 @@
           </mappings>
           <excludedPaths>
             <excludedPath path="/home/xs-a100/yj/nl2sql/models" />
+            <excludedPath local="true" path="$PROJECT_DIR$/.vscode" />
+            <excludedPath local="true" path="$PROJECT_DIR$/.claude" />
+            <excludedPath local="true" path="$PROJECT_DIR$/.specstory" />
+            <excludedPath local="true" path="$PROJECT_DIR$/superpowers-main" />
           </excludedPaths>
         </serverdata>
       </paths>

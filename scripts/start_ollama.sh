@@ -24,6 +24,15 @@ MODEFILE_PATH="$GENERATED_DIR/Modelfile"
 export OLLAMA_HOST="${OLLAMA_HOST_BIND}:${OLLAMA_PORT}"
 export OLLAMA_MODELS
 
+# 并发参数：3 路 SQL 生成 + 3 路修复同时进行，需要 ≥ 4 的并发槽
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-4}"
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+# 模型常驻显存，避免每次调用重新加载
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-30m}"
+# Flash Attention + KV cache 量化，显著加速大模型推理
+export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
+export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+
 if [[ -x "$OLLAMA_BIN" ]]; then
   OLLAMA_CMD="$OLLAMA_BIN"
 elif command -v ollama >/dev/null 2>&1; then
@@ -66,12 +75,16 @@ export LLM_API_KEY="${LLM_API_KEY:-ollama}"
 
 echo ""
 echo "Ollama 配置完成:"
-echo "  OLLAMA_HOST  = $OLLAMA_HOST"
-echo "  OLLAMA_MODELS= $OLLAMA_MODELS"
-echo "  OLLAMA_BIN   = $OLLAMA_CMD"
-echo "  LLM_BASE_URL = $LLM_BASE_URL"
-echo "  LLM_MODEL    = $LLM_MODEL"
-echo "  LLM_API_KEY  = $LLM_API_KEY"
+echo "  OLLAMA_HOST           = $OLLAMA_HOST"
+echo "  OLLAMA_MODELS         = $OLLAMA_MODELS"
+echo "  OLLAMA_BIN            = $OLLAMA_CMD"
+echo "  OLLAMA_NUM_PARALLEL   = $OLLAMA_NUM_PARALLEL"
+echo "  OLLAMA_KEEP_ALIVE     = $OLLAMA_KEEP_ALIVE"
+echo "  OLLAMA_FLASH_ATTENTION= $OLLAMA_FLASH_ATTENTION"
+echo "  OLLAMA_KV_CACHE_TYPE  = $OLLAMA_KV_CACHE_TYPE"
+echo "  LLM_BASE_URL          = $LLM_BASE_URL"
+echo "  LLM_MODEL             = $LLM_MODEL"
+echo "  LLM_API_KEY           = $LLM_API_KEY"
 echo ""
 echo "如需当前终端启动服务，执行:"
 echo "  \"$OLLAMA_CMD\" serve"

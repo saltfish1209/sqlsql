@@ -36,7 +36,7 @@ class TextToSQLSystem:
     """
 
     def __init__(self):
-        print(">>> [System Init] 正在初始化 Text-to-SQL 各组件...")
+        debug_print(">>> [System Init] 正在初始化 Text-to-SQL 各组件...")
 
         csv_path = str(settings.csv_path)
         schema_path = str(settings.schema_path)
@@ -56,7 +56,7 @@ class TextToSQLSystem:
         self._profiles = self.profiler.profile_all()
         self._profile_text = self.profiler.generate_profile_text(self._profiles)
 
-        print(">>> [System Init] 初始化完成。\n")
+        debug_print(">>> [System Init] 初始化完成。\n")
 
     # ──────────── 主入口 ────────────
 
@@ -78,7 +78,8 @@ class TextToSQLSystem:
         entity_start = time.time()
         debug_print("[Pipeline] Step2 实体提取开始...")
         entities = await self.entity_extractor.extract(
-            question, entity_schema, tracker
+            question, entity_schema, tracker,
+            schema_columns=self.linker.column_names,
         )
         debug_print(
             f"[Pipeline] Step2 实体提取完成，耗时 {time.time() - entity_start:.2f}s"
