@@ -94,7 +94,9 @@ class Settings:
     num_sql_per_path: int = 1
     thinking_temperature: float = 0.5
     icl_temperature: float = 0.1
-    direct_temperature: float = 0.0
+    # 与 ICL 路温度 (0.1) 拉开差距，使 ICL/Direct 两条快路在自洽性投票中保留多样性，
+    # 避免 system._try_flow 早停 (两路一致即取消 thinking) 时退化为单路决策。
+    direct_temperature: float = 0.4
     # 非思考路径的 max_tokens：SQL 本身很短，1024 足够
     max_gen_tokens: int = field(
         default_factory=lambda: int(os.getenv("LLM_MAX_GEN_TOKENS", "1024"))
@@ -151,8 +153,8 @@ class Settings:
     )
 
     # ── Profiler (论文新增) ──
-    profile_sample_rows: int = 50
-    profile_distinct_threshold: int = 20
+    profile_sample_rows: int = 100
+    profile_distinct_threshold: int = 80
 
     # ── 调试 ──
     debug_mode: bool = field(
