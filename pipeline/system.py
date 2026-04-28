@@ -21,7 +21,7 @@ from pipeline.entity_extractor import EntityExtractor
 from pipeline.generator import SQLGenerator
 from pipeline.llm_client import create_async_client, get_model_name
 from pipeline.profiler import DatabaseProfiler
-from pipeline.refiner import SQLRefiner
+from pipeline.refiner import SQLRefiner, majority_agreed
 from pipeline.schema_linker import SchemaLinker
 from pipeline.selector import SQLSelector
 from pipeline.utils import to_halfwidth, debug_print, TokenTracker
@@ -52,9 +52,11 @@ class TextToSQLSystem:
         self.selector = SQLSelector()
 
         # 自动 Profiling（论文新增）
+        # profile_map：{列名: 内联摘要}，只对当前 selected_columns 中的列注入，
+        # 拼接在各字段描述尾部，不做全量底部拼接。
         self.profiler = DatabaseProfiler(csv_path=csv_path)
         self._profiles = self.profiler.profile_all()
-        self._profile_text = self.profiler.generate_profile_text(self._profiles)
+        self._profile_map = self.profiler.get_profile_map(self._profiles)
 
         debug_print(">>> [System Init] 初始化完成。\n")
 
@@ -134,6 +136,14 @@ class TextToSQLSystem:
         unique_count = 0
         if final_res:
             unique_set = set(tuple(row) for row in final_res)
+            # 过滤全 NULL / 全空串行，保持与 evaluate 归一化逻辑一致
+            unique_set = {
+                row for row in unique_set
+                if any(
+                    v is not None and str(v).strip() != ""
+                    for v in row
+                )
+            }
             unique_count = len(unique_set)
             unique_rows = list(unique_set)
 
@@ -163,26 +173,68 @@ class TextToSQLSystem:
         tracker: TokenTracker,
         randomize_schema: bool = False,
     ) -> dict | None:
+        """
+        单梯队三路生成 + 快路早停。
+
+        编排逻辑：
+          1) 同时启动 thinking / icl / direct 三路（thinking 路较慢）。
+          2) **先等** ICL + Direct 两条快路；refine 后若结果一致 (majority_agreed)，
+             立即取消 thinking 路返回 —— 用于减少单条问题的尾延迟。
+          3) 否则等 thinking 路返回并加入 refine + 投票。
+        """
         m_schema = self.generator.build_m_schema_prompt(
             cols, self.linker.column_metadata,
             randomize=randomize_schema,
-            profile_text=self._profile_text,
+            profile_map=self._profile_map,
         )
 
         gen_start = time.time()
-        raw_cands = await self.generator.generate_candidates_async(
+        task_map = self.generator.start_candidate_tasks(
             question, m_schema, entities, evidence, tracker
         )
-        first_inference_time = time.time() - gen_start
-        debug_print(f"[Pipeline] Generator 原始候选 ({len(raw_cands)}个)")
+        fast_tasks = task_map.get("icl", []) + task_map.get("direct", [])
+        slow_tasks = task_map.get("thinking", [])
 
-        refined = await self.refiner.refine_async(
-            question, m_schema, raw_cands, cols, tracker
+        # —— 阶段一：等两条快路 ——
+        fast_raw = (
+            await asyncio.gather(*fast_tasks, return_exceptions=True)
+            if fast_tasks else []
         )
-        debug_print(f"[Pipeline] Refiner 修正后 ({len(refined)}个)")
+        fast_cands = [r for r in fast_raw if isinstance(r, dict)]
+        first_inference_time = time.time() - gen_start
+        debug_print(f"[Pipeline] 快路完成 ({len(fast_cands)}个候选)")
+
+        fast_refined = await self.refiner.refine_async(
+            question, m_schema, fast_cands, cols, tracker
+        )
+
+        # 早停判定：两条快路投票一致即可
+        fast_success = [c for c in fast_refined if c.get("status") == "success"]
+        if majority_agreed(fast_success) and slow_tasks:
+            debug_print(
+                f"[Pipeline] 快路 {len(fast_success)} 路结果一致 → 取消 thinking 路"
+            )
+            for t in slow_tasks:
+                t.cancel()
+            await asyncio.gather(*slow_tasks, return_exceptions=True)
+            all_refined = fast_refined
+        elif slow_tasks:
+            debug_print("[Pipeline] 快路未达成一致 → 等待 thinking 路兜底")
+            slow_raw = await asyncio.gather(*slow_tasks, return_exceptions=True)
+            slow_cands = [r for r in slow_raw if isinstance(r, dict)]
+            slow_refined = await self.refiner.refine_async(
+                question, m_schema, slow_cands, cols, tracker
+            )
+            all_refined = fast_refined + slow_refined
+            # 把"等到所有路全部生成完"的耗时也视作首次推理时间
+            first_inference_time = time.time() - gen_start
+        else:
+            all_refined = fast_refined
+
+        debug_print(f"[Pipeline] Refiner 修正后 ({len(all_refined)}个)")
 
         selected, reason, status = self.selector.select_best(
-            question, m_schema, refined
+            question, m_schema, all_refined
         )
         if selected is None:
             debug_print(f"[Pipeline] 选择结果: {reason}")
@@ -206,7 +258,7 @@ if __name__ == "__main__":
     system = TextToSQLSystem()
 
     test_questions = [
-        "\"协议库存可视化选购20230407\"批次的采购实施模式是怎样的？",
+        "物料编码500116755的中标厂家有哪些？",
     ]
 
     loop = asyncio.get_event_loop()

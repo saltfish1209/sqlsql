@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 from collections import Counter
 from typing import Any
@@ -34,8 +35,8 @@ class ColumnProfile:
     """单列的统计 Profile。"""
     __slots__ = (
         "name", "dtype_inferred", "total", "null_count", "null_ratio",
-        "distinct_count", "top_values", "format_pattern", "is_categorical",
-        "min_val", "max_val",
+        "distinct_count", "top_values", "sample_values", "format_pattern",
+        "is_categorical", "min_val", "max_val",
     )
 
     def __init__(self, name: str):
@@ -46,13 +47,15 @@ class ColumnProfile:
         self.null_ratio = 0.0
         self.distinct_count = 0
         self.top_values: list[tuple[str, int]] = []
+        # 供 schema 注入的示例值列表：优先高频值，不足 2 个时补随机值，保证至少 2 个
+        self.sample_values: list[str] = []
         self.format_pattern = ""
         self.is_categorical = False
         self.min_val: Any = None
         self.max_val: Any = None
 
     def to_summary(self) -> str:
-        """生成自然语言摘要，注入 prompt。"""
+        """生成自然语言摘要（含列名），供独立 profile 预览脚本使用。"""
         parts = [f"「{self.name}」"]
         parts.append(f"类型={self.dtype_inferred}")
         if self.null_ratio > 0.3:
@@ -66,6 +69,24 @@ class ColumnProfile:
         if self.min_val is not None and self.max_val is not None:
             parts.append(f"范围=[{self.min_val}, {self.max_val}]")
         return " | ".join(parts)
+
+    def to_inline_summary(self) -> str:
+        """
+        生成内联摘要（不含列名），直接拼接到 schema 字段描述末尾。
+        始终输出类型 + 示例值（至少 2 个，已在 _profile_column 中补齐）。
+        数值列额外附加范围。空值率偏高时额外提示。
+        """
+        parts: list[str] = []
+        parts.append(f"类型={self.dtype_inferred}")
+        if self.null_ratio > 0.3:
+            parts.append(f"空值率={self.null_ratio:.0%}")
+        if self.sample_values:
+            parts.append(f"示例={'/'.join(self.sample_values)}")
+        if self.dtype_inferred == "NUMERIC" and self.min_val is not None and self.max_val is not None:
+            parts.append(f"范围=[{self.min_val},{self.max_val}]")
+        if self.format_pattern:
+            parts.append(f"格式={self.format_pattern}")
+        return "[" + ", ".join(parts) + "]"
 
 
 # ─── 格式检测正则 ───
@@ -145,9 +166,29 @@ class DatabaseProfiler:
         # 是否为枚举 / 分类列
         p.is_categorical = p.distinct_count <= settings.profile_distinct_threshold
 
-        # Top 频率值
+        # Top 频率值（最多取 10 个，用于 to_summary 等统计展示）
         value_counts = non_null.value_counts().head(10)
         p.top_values = [(str(v), int(c)) for v, c in value_counts.items()]
+
+        # ── 示例值（供 schema 注入）──────────────────────────────────────
+        # 规则：优先使用高频值；若高频值不足 2 个，从剩余唯一值中随机补齐至 2 个。
+        # 最终保留不超过 6 个值，截断过长的单个值（> 25 字符），避免 prompt 过宽。
+        _MAX_SAMPLE_LEN = 25
+        _TARGET_MIN = 2
+        _TARGET_MAX = 6
+
+        top_strs = [v for v, _ in p.top_values[:_TARGET_MAX]]
+        if len(top_strs) < _TARGET_MIN:
+            # 从不在高频列表中的唯一值里随机采样补充
+            top_set = set(top_strs)
+            extra_pool = [
+                v for v in non_null.unique().tolist()
+                if v not in top_set
+            ]
+            needed = _TARGET_MIN - len(top_strs)
+            top_strs += random.sample(extra_pool, min(needed, len(extra_pool)))
+        # 截断过长值，避免占用过多 token
+        p.sample_values = [v[:_MAX_SAMPLE_LEN] for v in top_strs[:_TARGET_MAX]]
 
         # 格式检测
         p.format_pattern = _detect_format(non_null.head(50).tolist())
@@ -170,6 +211,15 @@ class DatabaseProfiler:
         for p in profiles:
             lines.append(f"  {p.to_summary()}")
         return "\n".join(lines)
+
+    def get_profile_map(self, profiles: list[ColumnProfile] | None = None) -> dict[str, str]:
+        """
+        返回 {列名: 内联摘要字符串} 字典。
+        供 build_m_schema_prompt 按选中列逐行注入，不做全量拼接。
+        """
+        if profiles is None:
+            profiles = self.profile_all()
+        return {p.name: p.to_inline_summary() for p in profiles}
 
     def get_categorical_values(self, profiles: list[ColumnProfile] | None = None) -> dict[str, list[str]]:
         """返回所有分类列的合法值列表，供 Refiner 做 Literal 校验。"""

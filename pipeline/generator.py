@@ -120,11 +120,16 @@ class SQLGenerator:
         all_metadata: list[dict],
         table_name: str = "procurement_table",
         randomize: bool = False,
-        profile_text: str = "",
+        profile_map: dict[str, str] | None = None,
     ) -> str:
         """
         构建精简 M-Schema Prompt。
         randomize=True 时随机打乱字段顺序（论文 Schema Randomization 策略）。
+
+        列行格式：(列名, 描述 [内联 profile])
+          - 不再从原始 schema 读取 data_type 和 Examples，由 profile_map 统一提供
+          - profile_map 内联摘要包含：类型 / 示例值（常见值或随机样本） / 数值范围 / 格式
+          - 仅对 selected_columns 中的列注入，不做全量底部拼接
         """
         cols = list(selected_columns)
         if randomize:
@@ -136,25 +141,28 @@ class SQLGenerator:
             )
             if meta:
                 desc = meta.get("column_description", "")
-                dtype = meta.get("data_type", "TEXT")
-                lines.append(f"  ({col_name}:{dtype}, {desc})")
+                inline = (profile_map or {}).get(col_name, "")
+                if inline:
+                    lines.append(f"  ({col_name}, {desc} {inline})")
+                else:
+                    lines.append(f"  ({col_name}, {desc})")
         lines.append("]")
-        if profile_text:
-            lines.append(f"\n{profile_text}")
         return "\n".join(lines)
 
     # ──────────── 异步生成 ────────────
 
-    async def generate_candidates_async(
+    def _build_path_specs(
         self,
         question: str,
         schema_prompt: str,
-        entities: list[str],
         evidence_dict: dict,
-        tracker: TokenTracker,
-        num_per_path: int | None = None,
-    ) -> list[dict]:
-        n = num_per_path or settings.num_sql_per_path
+    ) -> dict[str, tuple[str, str, float]]:
+        """
+        构建三路 SQL 生成的 (path_type, prompt, temperature) 配置。
+
+        以 path key (``"thinking" / "icl" / "direct"``) 为索引，
+        供 ``start_candidate_tasks`` 按需挑选启动哪几路。
+        """
         evidence_str = self.format_evidence(evidence_dict)
 
         thinking_prompt = (
@@ -187,15 +195,65 @@ class SQLGenerator:
             f"请直接输出SQL，用```sql ... ```包裹，不需要思考过程、解释或其他内容。\n"
         )
 
-        tasks = []
-        for _ in range(n):
-            tasks.append(self._call_llm(thinking_prompt, "thinking_path", tracker, settings.thinking_temperature))
-        for _ in range(n):
-            tasks.append(self._call_llm(icl_prompt, "ICL_Path", tracker, settings.icl_temperature))
-        for _ in range(n):
-            tasks.append(self._call_llm(direct_prompt, "Direct_Path", tracker, settings.direct_temperature))
+        return {
+            "thinking": ("thinking_path", thinking_prompt, settings.thinking_temperature),
+            "icl": ("ICL_Path", icl_prompt, settings.icl_temperature),
+            "direct": ("Direct_Path", direct_prompt, settings.direct_temperature),
+        }
 
-        results = await asyncio.gather(*tasks)
+    def start_candidate_tasks(
+        self,
+        question: str,
+        schema_prompt: str,
+        entities: list[str],
+        evidence_dict: dict,
+        tracker: TokenTracker,
+        num_per_path: int | None = None,
+        paths: tuple[str, ...] = ("thinking", "icl", "direct"),
+    ) -> dict[str, list[asyncio.Task]]:
+        """
+        立即启动指定路径的 SQL 生成任务（不等待），返回 ``{path_key: [Task,...]}``。
+
+        调用方负责自己 ``await`` / ``cancel`` 这些任务，便于实现"快路一致即取消
+        thinking 路"等早停策略。
+        """
+        n = num_per_path or settings.num_sql_per_path
+        specs = self._build_path_specs(question, schema_prompt, evidence_dict)
+
+        task_map: dict[str, list[asyncio.Task]] = {}
+        for key in paths:
+            if key not in specs:
+                continue
+            path_type, prompt, temperature = specs[key]
+            task_map[key] = [
+                asyncio.create_task(
+                    self._call_llm(prompt, path_type, tracker, temperature)
+                )
+                for _ in range(n)
+            ]
+        return task_map
+
+    async def generate_candidates_async(
+        self,
+        question: str,
+        schema_prompt: str,
+        entities: list[str],
+        evidence_dict: dict,
+        tracker: TokenTracker,
+        num_per_path: int | None = None,
+    ) -> list[dict]:
+        """
+        默认入口：并发跑三路，等所有路返回，过滤 None。
+
+        若需要"快路先返回、按需取消 thinking"的行为，请改用
+        ``start_candidate_tasks`` + ``asyncio.gather`` / ``cancel`` 自行编排。
+        """
+        task_map = self.start_candidate_tasks(
+            question, schema_prompt, entities, evidence_dict, tracker,
+            num_per_path=num_per_path,
+        )
+        all_tasks = [t for ts in task_map.values() for t in ts]
+        results = await asyncio.gather(*all_tasks)
         return [r for r in results if r is not None]
 
     async def _call_llm(

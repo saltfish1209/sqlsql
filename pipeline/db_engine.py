@@ -7,7 +7,7 @@ import os
 import sqlite3
 import pandas as pd
 
-from pipeline.utils import to_halfwidth, debug_print
+from pipeline.utils import to_halfwidth, strip_invisible, debug_print
 
 
 class DBEngine:
@@ -24,7 +24,8 @@ class DBEngine:
         df = pd.read_csv(csv_path)
         str_cols = df.select_dtypes(include=["object"]).columns
         for col in str_cols:
-            df[col] = df[col].apply(to_halfwidth)
+            # 先全角→半角 + 标点归一化，再去除不可见脏字符
+            df[col] = df[col].apply(to_halfwidth).apply(strip_invisible)
         df.to_sql(self.table_name, self.conn, index=False, if_exists="replace")
         debug_print(f"[DB] 数据已加载，表名: {self.table_name}, 行数: {len(df)}")
 

@@ -3,6 +3,36 @@
 """
 from __future__ import annotations
 
+import re
+
+# 匹配所有应剔除的"脏"字符：
+#   \x00-\x08, \x0b-\x0c, \x0e-\x1f  ASCII 控制字符（保留 \t \n \r）
+#   \x7f                               DEL
+#   \ufffd                             Unicode 替换字符（常见于编码错误）
+#   \ufeff                             BOM / 零宽非断空格
+#   \u200b-\u200f \u202a-\u202e       零宽 / 方向控制字符
+#   \ue000-\uf8ff                      Unicode 私有使用区 (BMP)
+#   \U000f0000-\U000fffff              Unicode 私有使用区 (Plane 15)
+#   \U00100000-\U0010ffff              Unicode 私有使用区 (Plane 16)
+_DIRTY_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"
+    r"\ufffd\ufeff"
+    r"\u200b-\u200f\u202a-\u202e"
+    r"\ue000-\uf8ff"
+    r"\U000f0000-\U000fffff"
+    r"\U00100000-\U0010ffff]"
+)
+
+
+def strip_invisible(text) -> str:
+    """
+    去除字符串中的不可见脏字符（控制字符、私有区字符、零宽字符、BOM 等）。
+    非字符串值原样返回。
+    """
+    if not isinstance(text, str):
+        return text if text is not None else ""
+    return _DIRTY_CHARS_RE.sub("", text).strip()
+
 
 def debug_print(*args, **kwargs):
     """仅在 DEBUG_MODE=True 时输出，用于中间步骤日志。"""

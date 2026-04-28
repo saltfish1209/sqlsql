@@ -35,12 +35,20 @@ def _result_key(result) -> str:
         return str(result)
 
 
-def _majority_agreed(successful: list[dict]) -> bool:
-    """至少两路成功且存在一对结果完全一致，则投票已锁定。"""
+def majority_agreed(successful: list[dict]) -> bool:
+    """至少两路成功且存在一对结果完全一致，则投票已锁定。
+
+    暴露为模块级公共函数，供 ``pipeline.system._try_flow`` 在收到快路结果后
+    判断是否可以提前取消 thinking 路。
+    """
     if len(successful) < 2:
         return False
     counts = Counter(_result_key(c.get("result")) for c in successful)
     return max(counts.values()) >= 2
+
+
+# 旧的下划线版保持别名，兼容潜在外部引用。
+_majority_agreed = majority_agreed
 
 
 def _extract_where_literals(sql: str) -> list[tuple[str, str]]:
@@ -95,7 +103,7 @@ class SQLRefiner:
 
         # 早停：按投票一致性，若已有两路成功且结果一致，
         # 无论剩余路是否出错都不再修复——第三路正确与否不影响多数票。
-        if _majority_agreed(refined):
+        if majority_agreed(refined):
             debug_print(
                 f"[Refiner] 已有 {len(refined)} 路结果一致，跳过 {len(need_repair)} 个修复任务"
             )
