@@ -6,6 +6,10 @@
 
 DEBUG_MODE=True  : 输出 SQL、GT、Pred 详细信息
 DEBUG_MODE=False : 仅输出 [编号] 状态 耗时
+
+本模块对外暴露 ``run_evaluation(system, ...)``，
+任何提供 ``async run_pipeline(question)->dict`` 接口的系统都可复用此评估流程
+（例如 baseline/evaluate.py 复用同一套准确率计算与日志逻辑）。
 """
 from __future__ import annotations
 
@@ -20,7 +24,6 @@ import pandas as pd
 
 sys.path.insert(0, str(os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))))
 from config.settings import settings
-from pipeline.system import TextToSQLSystem
 from pipeline.utils import debug_print
 
 DEBUG = settings.debug_mode
@@ -65,21 +68,38 @@ def normalize_execution_result(result):
     return out
 
 
-async def main():
+def _load_test_df() -> pd.DataFrame | None:
+    """与 prepare_data.py 完全一致的切分，仅返回最后 10% 测试集。"""
     csv_path = str(settings.train_csv)
     if not os.path.isfile(csv_path):
         print(f"[ERROR] 训练数据文件不存在: {csv_path}")
-        return
+        return None
     df_full = pd.read_csv(csv_path)
     df_full = df_full[df_full["SQL验证状态"] == "MATCH"].copy()
     df_full = df_full.sample(frac=1, random_state=settings.random_state).reset_index(drop=True)
-
     total_len = len(df_full)
     val_end = int(total_len * (settings.train_split + settings.val_split))
     df = df_full.iloc[val_end:].reset_index(drop=True)
     print(f"总 MATCH 数据 {total_len} 条 → 测试集(后 {settings.test_split:.0%}): {len(df)} 条")
+    return df
 
-    system = TextToSQLSystem()
+
+async def run_evaluation(system, output_path: str | None = None, label: str = "System") -> dict:
+    """
+    通用评估入口 —— 任何带 ``async run_pipeline(question)->dict`` 接口的系统都可调用。
+
+    Args:
+        system: 已初始化好的系统实例 (例如 TextToSQLSystem 或 BaselineSystem)。
+        output_path: 错误日志 JSON 输出路径；为 None 时写到本文件同目录的 error_analysis.json。
+        label: 仅用于日志前缀。
+
+    Returns:
+        包含 accuracy / correct / total / 平均耗时 等指标的字典。
+    """
+    df = _load_test_df()
+    if df is None:
+        return {"accuracy": 0.0, "correct": 0, "total": 0}
+
     correct = 0
     total = len(df)
     logs = []
@@ -91,7 +111,7 @@ async def main():
     for idx, row in df.iterrows():
         question = str(row["生成问题"]).strip()
         raw_gt = row["生成结果"]
-        debug_print(f"\n[{idx+1}/{total}] 问题: {question}")
+        debug_print(f"\n[{label}][{idx + 1}/{total}] 问题: {question}")
 
         t0 = time.time()
         try:
@@ -104,6 +124,7 @@ async def main():
             sum_total += total_cost
             sum_repair_each += sum(repair_times)
             repair_rounds += len(repair_times)
+
             gt_set = parse_ground_truth(raw_gt)
             pred_set = normalize_execution_result(output.get("execution_result"))
             ok = gt_set == pred_set
@@ -114,11 +135,19 @@ async def main():
                 print(f"  SQL: {output.get('final_sql')}")
                 print(f"  GT:  {gt_set}")
                 print(f"  Pred:{pred_set}")
-                print(f"  {icon} | total={total_cost:.2f}s | first_infer={first_infer:.2f}s | repairs={repair_times}")
+                print(
+                    f"  {icon} | total={total_cost:.2f}s | first_infer={first_infer:.2f}s | "
+                    f"repairs={repair_times}"
+                )
             else:
-                print(f"[{idx+1}/{total}] {icon} total={total_cost:.2f}s first_infer={first_infer:.2f}s repairs={repair_times}")
+                print(
+                    f"[{label}][{idx + 1}/{total}] {icon} total={total_cost:.2f}s "
+                    f"first_infer={first_infer:.2f}s repairs={repair_times}"
+                )
+
             logs.append({
-                "id": idx, "question": question,
+                "id": idx,
+                "question": question,
                 "sql": output.get("final_sql"),
                 "gt_raw": str(raw_gt),
                 "gt_parsed": list(gt_set),
@@ -128,24 +157,51 @@ async def main():
         except Exception as e:
             dt = time.time() - t0
             msg = f"FAIL(异常) {dt:.2f}s"
-            print(f"[{idx+1}/{total}] {msg}" if not DEBUG else f"  FAIL 异常: {e}")
-            logs.append({"id": idx, "question": question, "error": str(e), "is_correct": False})
+            if DEBUG:
+                print(f"  FAIL 异常: {e}")
+            else:
+                print(f"[{label}][{idx + 1}/{total}] {msg}")
+            logs.append({
+                "id": idx, "question": question,
+                "error": str(e), "is_correct": False,
+            })
 
-    acc = correct / total if total else 0
-    print(f"\n{'='*50}")
-    print(f"最终准确率: {acc:.2%} ({correct}/{total})")
+    acc = correct / total if total else 0.0
     avg_first_infer = sum_first_infer / total if total else 0.0
     avg_total = sum_total / total if total else 0.0
     avg_repair_each = sum_repair_each / repair_rounds if repair_rounds else 0.0
-    print(f"平均首次推理耗时: {avg_first_infer:.2f}s")
-    print(f"平均每次修正耗时: {avg_repair_each:.2f}s (共 {repair_rounds} 次修正)")
-    print(f"平均总耗时: {avg_total:.2f}s")
+
+    print(f"\n{'=' * 50}")
+    print(f"[{label}] 最终准确率: {acc:.2%} ({correct}/{total})")
+    print(f"[{label}] 平均首次推理耗时: {avg_first_infer:.2f}s")
+    print(f"[{label}] 平均每次修正耗时: {avg_repair_each:.2f}s (共 {repair_rounds} 次修正)")
+    print(f"[{label}] 平均总耗时: {avg_total:.2f}s")
 
     err_logs = [l for l in logs if not l["is_correct"]]
-    out_path = os.path.join(os.path.dirname(__file__), "error_analysis.json")
-    with open(out_path, "w", encoding="utf-8") as f:
+    if output_path is None:
+        output_path = os.path.join(os.path.dirname(__file__), "error_analysis.json")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(err_logs, f, ensure_ascii=False, indent=2)
-    print(f"错误日志: {out_path}")
+    print(f"[{label}] 错误日志: {output_path}")
+
+    return {
+        "label": label,
+        "accuracy": acc,
+        "correct": correct,
+        "total": total,
+        "avg_first_inference_time": avg_first_infer,
+        "avg_repair_time_each": avg_repair_each,
+        "repair_rounds": repair_rounds,
+        "avg_total_time": avg_total,
+        "error_log_path": output_path,
+    }
+
+
+async def main():
+    from pipeline.system import TextToSQLSystem
+    system = TextToSQLSystem()
+    await run_evaluation(system, label="full_pipeline")
 
 
 if __name__ == "__main__":
