@@ -21,10 +21,15 @@ class DBEngine:
         self._load_csv(csv_path)
 
     def _load_csv(self, csv_path: str):
-        df = pd.read_csv(csv_path)
+        # 关键修复：必须以字符串方式读取，否则 pandas 会把整数编号列
+        # （采购订单号 / 采购申请号 / 物料编码 / 供应商编码 …）推断成
+        # float64，'4501596405' 变成 '4501596405.0' 写进 SQLite，
+        # 导致 LLM 生成的 WHERE = '4501596405' 永远不命中。
+        # 与 schema_linker.py / profiler.py 保持一致 (dtype=str + keep_default_na=False)。
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False, na_values=[""])
         str_cols = df.select_dtypes(include=["object"]).columns
         for col in str_cols:
-            # 先全角→半角 + 标点归一化，再去除不可见脏字符
+            # 全角→半角 + 标点归一化，再去除不可见脏字符
             df[col] = df[col].apply(to_halfwidth).apply(strip_invisible)
         df.to_sql(self.table_name, self.conn, index=False, if_exists="replace")
         debug_print(f"[DB] 数据已加载，表名: {self.table_name}, 行数: {len(df)}")

@@ -74,13 +74,25 @@ class ColumnProfile:
         """
         生成内联摘要（不含列名），直接拼接到 schema 字段描述末尾。
         始终输出类型 + 示例值（至少 2 个，已在 _profile_column 中补齐）。
-        数值列额外附加范围。空值率偏高时额外提示。
+        - 低基数枚举列（distinct ≤ enum_full_threshold）会**全部列出取值**，
+          这样 Generator 才能识别到 "招标模式 ∈ {总部直接组织实施, 公司集中招标, …}" 这类
+          细粒度过滤值（error.txt 案例 17 的根因）。
+        - 数值列额外附加范围。空值率偏高时额外提示。
         """
         parts: list[str] = []
         parts.append(f"类型={self.dtype_inferred}")
         if self.null_ratio > 0.3:
             parts.append(f"空值率={self.null_ratio:.0%}")
-        if self.sample_values:
+        # 低基数枚举：列出全部取值（避免示例只覆盖 2~6 个）
+        full_threshold = settings.profile_enum_full_threshold
+        if (
+            self.is_categorical
+            and 1 < self.distinct_count <= full_threshold
+            and self.top_values
+        ):
+            all_vals = [v for v, _ in self.top_values[: full_threshold]]
+            parts.append(f"枚举值={'/'.join(all_vals)}")
+        elif self.sample_values:
             parts.append(f"示例={'/'.join(self.sample_values)}")
         if self.dtype_inferred == "NUMERIC" and self.min_val is not None and self.max_val is not None:
             parts.append(f"范围=[{self.min_val},{self.max_val}]")
@@ -166,8 +178,12 @@ class DatabaseProfiler:
         # 是否为枚举 / 分类列
         p.is_categorical = p.distinct_count <= settings.profile_distinct_threshold
 
-        # Top 频率值（最多取 10 个，用于 to_summary 等统计展示）
-        value_counts = non_null.value_counts().head(10)
+        # Top 频率值：低基数枚举列保留全部，其它列保留 top-10
+        full_threshold = settings.profile_enum_full_threshold
+        head_n = max(10, full_threshold) if (
+            p.is_categorical and p.distinct_count <= full_threshold
+        ) else 10
+        value_counts = non_null.value_counts().head(head_n)
         p.top_values = [(str(v), int(c)) for v, c in value_counts.items()]
 
         # ── 示例值（供 schema 注入）──────────────────────────────────────

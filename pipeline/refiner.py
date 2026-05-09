@@ -143,9 +143,12 @@ class SQLRefiner:
                 f"【执行反馈】{current_error}\n"
                 f"【修复规则】\n"
                 f"1. 修正列名错误 (no such column)，只能使用合法列名列表中的列。\n"
-                f"2. 结果为空时将 '=' 改为 'LIKE'。\n"
-                f"3. 如果字面量不存在于该列，使用 LIKE '%关键词%' 替代精确匹配。\n"
-                f"4. 补全不完整的 SELECT-FROM-WHERE 结构。\n"
+                f"2. 补全不完整的 SELECT-FROM-WHERE 结构。\n"
+                f"3. 字面量不存在 (LITERAL_MISMATCH) 时：把 `=` 改成 `LIKE '%X%'`，"
+                f"或换到 schema 证据中提示的真实列。\n"
+                f"4. 所有字面量必须用单引号包裹，编号 / 编码字段也是。\n"
+                f"5. SELECT 业务实体时 WHERE 末尾追加 `AND \"目标列\" != '' "
+                f"AND \"目标列\" IS NOT NULL`。\n"
                 f"直接输出修复后的 SQL，用```sql ... ```包裹，不要思考过程。"
             )
             try:

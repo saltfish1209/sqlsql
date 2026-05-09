@@ -13,9 +13,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 
 from config.settings import settings
+from generation.multi_result_utils import MULTI_RESULT_SEP
 from pipeline.db_engine import DBEngine
 from pipeline.entity_extractor import EntityExtractor
 from pipeline.generator import SQLGenerator
@@ -25,6 +28,10 @@ from pipeline.refiner import SQLRefiner, majority_agreed
 from pipeline.schema_linker import SchemaLinker
 from pipeline.selector import SQLSelector
 from pipeline.utils import to_halfwidth, debug_print, TokenTracker
+
+_SQL_SINGLE_QUOTE_LITERAL_RE = re.compile(r"'([^']*)'")
+_CJK_RE = r"\u4e00-\u9fff"
+_ASCII_WORD_RE = r"A-Za-z0-9"
 
 
 class TextToSQLSystem:
@@ -63,9 +70,37 @@ class TextToSQLSystem:
     # ──────────── 主入口 ────────────
 
     async def run_pipeline_async(self, question: str) -> dict:
+        """
+        分发器：先判断是否多子问题，若是则逐题作答（agentic 风格）后合并；
+        否则直接走单题流程。
+
+        多题输出约定（与 evaluate.py、数据集生成端保持一致）：
+          - ``execution_result``: ``list[list[tuple]]``  # 每个元素是一个子问题的结果集
+          - ``final_sql``       : ``"sql1 ‖ sql2"``       # 子 SQL 用 MULTI_RESULT_SEP 拼
+          - ``is_multi_question`` = True
+          - ``sub_questions``  : list[str]
+        """
+        start = time.time()
+        question = to_halfwidth(question)
+
+        # —— Agentic 拆题：仅当问题里出现 ≥2 个 ?/？ 时才请 LLM 判一次 —— 
+        sub_questions = await self._maybe_split_question(question)
+        if len(sub_questions) <= 1:
+            return await self._run_single_pipeline(question)
+
+        debug_print(f"[Pipeline] 多子问题模式 → {sub_questions}")
+        sub_outputs: list[dict] = []
+        for i, sub_q in enumerate(sub_questions, 1):
+            debug_print(f"[Pipeline] >>> 子问题 {i}/{len(sub_questions)}: {sub_q}")
+            sub_out = await self._run_single_pipeline(sub_q)
+            sub_outputs.append(sub_out)
+
+        return self._merge_sub_outputs(question, sub_questions, sub_outputs, start)
+
+    async def _run_single_pipeline(self, question: str) -> dict:
+        """单题流程（原 run_pipeline_async 主体）。"""
         start = time.time()
         tracker = TokenTracker()
-        question = to_halfwidth(question)
         K = settings.top_k_embed
         first_inference_time = 0.0
         selected_repair_times: list[float] = []
@@ -129,6 +164,8 @@ class TextToSQLSystem:
                 "repair_times": selected_repair_times,
                 "cost_time": total_time,
                 "token_usage": tracker.get_report(),
+                "entities": entities,
+                "is_multi_question": False,
             }
 
         final_res = best.get("result")
@@ -156,11 +193,181 @@ class TextToSQLSystem:
             "repair_times": selected_repair_times,
             "cost_time": total_time,
             "token_usage": tracker.get_report(),
+            "entities": entities,
+            "is_multi_question": False,
         }
 
     async def run_pipeline(self, question: str) -> dict:
         """别名，供 evaluate 脚本调用。"""
         return await self.run_pipeline_async(question)
+
+    # ──────────── Agentic 多子问题拆分 ────────────
+
+    async def _maybe_split_question(self, question: str) -> list[str]:
+        """
+        判断问题是否包含多个独立子问题，并返回子问题列表（单题时长度=1）。
+
+        策略：
+          1) 廉价过滤：仅当问号 ≥2 时才请 LLM 判断（节省 token）。
+          2) LLM 输出 JSON 数组；解析失败或返回 ≤1 项时，回退为单题。
+          3) 整个机制可由 ``settings.enable_question_split`` 关闭（缺省开启）。
+        """
+        if not getattr(settings, "enable_question_split", True):
+            return [question]
+
+        qmark_count = question.count("？") + question.count("?")
+        if qmark_count < 2:
+            return [question]
+
+        prompt = (
+            "你是一个 NL2SQL 助手。判断下面这条用户问题是否包含**多个相互独立**的子问题"
+            "（即每个子问题都可以独立由一条 SQL 回答）。\n"
+            "- 如果是，把它拆解为多个独立子问题，**不要丢失任何过滤条件 / 实体**，"
+            "每个子问题都要继承原问题中的所有实体。\n"
+            "- 如果不是（单一问题），直接返回只含一个元素的数组。\n"
+            "只输出 JSON 字符串数组，不要其他文字。\n\n"
+            "[示例]\n"
+            "问题: 物料编码500116755的中标厂家有哪些？\n"
+            "输出: [\"物料编码500116755的中标厂家有哪些？\"]\n\n"
+            "问题: 许继电气共中标几个批次？这些批次的批次号分别是什么？\n"
+            "输出: [\"许继电气共中标几个批次？\", \"许继电气中标的批次号分别是什么？\"]\n\n"
+            "问题: 珠海许继的中标总金额是多少？平均单价又是多少？\n"
+            "输出: [\"珠海许继的中标总金额是多少？\", \"珠海许继的中标平均单价是多少？\"]\n\n"
+            f"[当前问题]\n{question}\n输出:"
+        )
+
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=256,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            arr = self._parse_str_array(text)
+            arr = [s.strip() for s in arr if isinstance(s, str) and s.strip()]
+            if len(arr) >= 2:
+                return arr
+        except Exception as e:  # pragma: no cover - LLM 异常时回退
+            debug_print(f"[Pipeline] 拆题失败，回退为单题: {e}")
+
+        return [question]
+
+    @staticmethod
+    def _parse_str_array(text: str) -> list[str]:
+        """从 LLM 文本响应中抽出 JSON 字符串数组。"""
+        if not text:
+            return []
+        # 直接 JSON
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return [str(x) for x in obj]
+        except Exception:
+            pass
+        # 截取首尾方括号再 parse
+        m = re.search(r"\[.*\]", text, re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                if isinstance(obj, list):
+                    return [str(x) for x in obj]
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def _merge_sub_outputs(
+        original_question: str,
+        sub_questions: list[str],
+        sub_outputs: list[dict],
+        start_ts: float,
+    ) -> dict:
+        """合并多子问题输出，与 evaluate 的多结果比较口径对齐。"""
+        sub_sqls = [str(o.get("final_sql") or "") for o in sub_outputs]
+        sub_results: list[list] = []
+        for o in sub_outputs:
+            sub_res = o.get("execution_result") or []
+            sub_results.append(list(sub_res))
+
+        # 实体：按子问题前缀汇总
+        sub_entities = []
+        for o in sub_outputs:
+            sub_entities.append(o.get("entities") or [])
+
+        first_inferences = [float(o.get("first_inference_time", 0.0) or 0.0) for o in sub_outputs]
+        all_repairs: list[float] = []
+        for o in sub_outputs:
+            all_repairs.extend(o.get("repair_times", []) or [])
+
+        return {
+            "final_sql": MULTI_RESULT_SEP.join(sub_sqls),
+            "execution_result": sub_results,        # list[list[tuple]]
+            "unique_rows_count": sum(len(r) for r in sub_results),
+            "reason": "multi_success" if all(o.get("reason") == "success" for o in sub_outputs) else "multi_partial",
+            "first_inference_time": max(first_inferences) if first_inferences else 0.0,
+            "repair_times": all_repairs,
+            "cost_time": time.time() - start_ts,
+            "token_usage": {},                       # 各子题 tracker 暂不合并
+            "entities": [e for sub in sub_entities for e in sub],
+            "is_multi_question": True,
+            "sub_questions": sub_questions,
+            "sub_outputs": sub_outputs,
+        }
+
+    # ──────────── 工具方法 ────────────
+
+    @staticmethod
+    def _normalize_sql_literals(sql: str) -> str:
+        """轻量归一化生成 SQL：中文标点半角化 + 中英混排空格修正。"""
+        if not sql:
+            return sql
+        # 先做整句半角化：中文标点/全角符号 -> 英文半角符号
+        sql = to_halfwidth(sql)
+        # 修正标识符里的中英混排空格：计划批次 ID -> 计划批次ID
+        sql = re.sub(rf"(?<=[{_CJK_RE}])\s+(?=[{_ASCII_WORD_RE}])", "", sql)
+        sql = re.sub(rf"(?<=[{_ASCII_WORD_RE}])\s+(?=[{_CJK_RE}])", "", sql)
+
+        def _norm_match(m: re.Match[str]) -> str:
+            lit = to_halfwidth(m.group(1))
+            # 例：ECP 招标合同 -> ECP招标合同, II 型 -> II型
+            lit = re.sub(rf"(?<=[{_ASCII_WORD_RE}])\s+(?=[{_CJK_RE}])", "", lit)
+            lit = re.sub(rf"(?<=[{_CJK_RE}])\s+(?=[{_ASCII_WORD_RE}])", "", lit)
+            return f"'{lit}'"
+
+        return _SQL_SINGLE_QUOTE_LITERAL_RE.sub(_norm_match, sql)
+
+    @classmethod
+    def _normalize_candidate_sqls(cls, cands: list[dict]) -> list[dict]:
+        """对候选 SQL 做轻量字面量归一化（原地修改，最小改动）。"""
+        for c in cands:
+            if isinstance(c, dict) and c.get("sql"):
+                c["sql"] = cls._normalize_sql_literals(str(c["sql"]))
+        return cands
+
+    @staticmethod
+    def _has_nonempty_result(cand: dict) -> bool:
+        """判断 refined 候选的执行结果是否包含至少一行真实业务数据。
+
+        把 `[]` / `[(0,)]` / `[(None,)]` / `[('',)]` / `[(0, '')]` 这类
+        "聚合零 / 全空"的结果统一视作"空"，让早停继续等慢路兜底。
+        """
+        result = cand.get("result")
+        if not result:
+            return False
+        for row in result:
+            if not isinstance(row, (list, tuple)):
+                if row is not None and str(row).strip() not in ("", "0"):
+                    return True
+                continue
+            for v in row:
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s == "" or s == "0" or s == "0.0":
+                    continue
+                return True
+        return False
 
     # ──────────── 单梯队尝试 ────────────
 
@@ -189,18 +396,27 @@ class TextToSQLSystem:
         )
 
         gen_start = time.time()
+        # paths：thinking + icl + direct + plan（agentic 多步抽取，受 settings 开关控制）
+        active_paths: tuple[str, ...] = (
+            ("thinking", "icl", "direct", "plan")
+            if settings.enable_plan_path
+            else ("thinking", "icl", "direct")
+        )
         task_map = self.generator.start_candidate_tasks(
-            question, m_schema, entities, evidence, tracker
+            question, m_schema, entities, evidence, tracker,
+            paths=active_paths,
         )
         fast_tasks = task_map.get("icl", []) + task_map.get("direct", [])
-        slow_tasks = task_map.get("thinking", [])
+        slow_tasks = task_map.get("thinking", []) + task_map.get("plan", [])
 
         # —— 阶段一：等两条快路 ——
         fast_raw = (
             await asyncio.gather(*fast_tasks, return_exceptions=True)
             if fast_tasks else []
         )
-        fast_cands = [r for r in fast_raw if isinstance(r, dict)]
+        fast_cands = self._normalize_candidate_sqls(
+            [r for r in fast_raw if isinstance(r, dict)]
+        )
         first_inference_time = time.time() - gen_start
         debug_print(f"[Pipeline] 快路完成 ({len(fast_cands)}个候选)")
 
@@ -208,20 +424,31 @@ class TextToSQLSystem:
             question, m_schema, fast_cands, cols, tracker
         )
 
-        # 早停判定：两条快路投票一致即可
+        # 早停判定：两条快路投票一致 **且**结果非空。
+        # 案例 [2]/[11]/[13]/[15] 都是快路一致但结果是空集 / `[(0,)]` 之类的"伪一致"，
+        # 仅靠投票一致会过早杀掉慢路（thinking + plan）失去兜底机会。
         fast_success = [c for c in fast_refined if c.get("status") == "success"]
-        if majority_agreed(fast_success) and slow_tasks:
+        fast_voted_nonempty = (
+            majority_agreed(fast_success)
+            and any(self._has_nonempty_result(c) for c in fast_success)
+        )
+        if fast_voted_nonempty and slow_tasks:
             debug_print(
-                f"[Pipeline] 快路 {len(fast_success)} 路结果一致 → 取消 thinking 路"
+                f"[Pipeline] 快路 {len(fast_success)} 路一致且结果非空 → 取消慢路"
             )
             for t in slow_tasks:
                 t.cancel()
             await asyncio.gather(*slow_tasks, return_exceptions=True)
             all_refined = fast_refined
         elif slow_tasks:
-            debug_print("[Pipeline] 快路未达成一致 → 等待 thinking 路兜底")
+            if majority_agreed(fast_success):
+                debug_print("[Pipeline] 快路一致但结果为空 → 仍等慢路兜底")
+            else:
+                debug_print("[Pipeline] 快路未达成一致 → 等慢路兜底")
             slow_raw = await asyncio.gather(*slow_tasks, return_exceptions=True)
-            slow_cands = [r for r in slow_raw if isinstance(r, dict)]
+            slow_cands = self._normalize_candidate_sqls(
+                [r for r in slow_raw if isinstance(r, dict)]
+            )
             slow_refined = await self.refiner.refine_async(
                 question, m_schema, slow_cands, cols, tracker
             )
@@ -257,12 +484,45 @@ class TextToSQLSystem:
 if __name__ == "__main__":
     system = TextToSQLSystem()
 
-    test_questions = [
-        "物料编码500116755的中标厂家有哪些？",
+    test_cases = [
+        {
+            "question": "物料编码500116755的中标厂家有哪些？",
+            "ground_truth": (
+                "南京自强铁路车辆配件有限公司，天铂电力集团有限公司，苏州华源电气有限公司，"
+                "江苏优家宁科技有限公司，江苏镇安电力设备有限公司，广蓝电气设备有限公司，"
+                "河南平高通用电气有限公司，江苏一变电力装备有限公司，扬州电力设备修造厂有限公司，"
+                "浙江聚弘凯电气有限公司，珠海沃顿电气有限公司，江苏大烨智能电气股份有限公司，"
+                "北京合纵科技股份有限公司，江西环林集团股份有限公司，上海南华兰陵电气有限公司，"
+                "扬州北辰电气集团有限公司，珠海许继电气有限公司，许继德理施尔电气有限公司，"
+                "上海敬道电气有限公司，梵迩佳智能电气有限公司"
+            ),
+        }
     ]
 
+    def _parse_gt(gt: str) -> set[str]:
+        return {
+            x.strip()
+            for x in str(gt).replace("\n", "").split("，")
+            if x.strip()
+        }
+
+    def _normalize_pred_rows(rows) -> set[str]:
+        if not rows:
+            return set()
+        out = set()
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                continue
+            vals = ["" if v is None else str(v).strip() for v in row]
+            if all(v == "" for v in vals):
+                continue
+            out.add("|".join(vals))
+        return out
+
     loop = asyncio.get_event_loop()
-    for q in test_questions:
+    for case in test_cases:
+        q = case["question"]
+        gt_set = _parse_gt(case["ground_truth"])
         print("\n" + "=" * 60)
         result = loop.run_until_complete(system.run_pipeline_async(q))
         print(f"FINAL OUTPUT (Time: {result['cost_time']:.2f}s)")
@@ -276,4 +536,12 @@ if __name__ == "__main__":
         print(f"Unique Rows: {result['unique_rows_count']}")
         res = result["execution_result"]
         print(f"Result (First 10): {res[:10] if res else 'Empty'}")
+        pred_set = _normalize_pred_rows(res)
+        ok = pred_set == gt_set
+        print(f"Correctness: {'OK' if ok else 'FAIL'}")
+        if not ok:
+            missing = sorted(gt_set - pred_set)
+            extra = sorted(pred_set - gt_set)
+            print(f"Missing ({len(missing)}): {missing[:10]}")
+            print(f"Extra ({len(extra)}): {extra[:10]}")
         print("=" * 60)

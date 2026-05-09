@@ -148,10 +148,13 @@ class SchemaLinker:
     def _save_cache(self):
         os.makedirs(self.cache_dir, exist_ok=True)
         data = {
-            "version": 2,
+            # version=3：lsh_threshold 调整后必须重建（MinHash 分桶随阈值变化）
+            "version": 3,
             "names": self.column_names,
             "exact": self.exact_index,
             "lsh": self.lsh_index,
+            "lsh_threshold": settings.lsh_threshold,
+            "lsh_num_perm": settings.lsh_num_perm,
             "timestamp": os.path.getmtime(self.csv_path) if os.path.exists(self.csv_path) else time.time(),
             "cross_encoder_path": self._cross_encoder_path,
         }
@@ -167,7 +170,7 @@ class SchemaLinker:
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
-            if data.get("version") != 2:
+            if data.get("version") != 3:
                 debug_print("[Schema] 缓存版本不兼容，重建索引。")
                 return False
             if data["timestamp"] != os.path.getmtime(self.csv_path):
@@ -175,6 +178,12 @@ class SchemaLinker:
                 return False
             if data.get("cross_encoder_path") != self._cross_encoder_path:
                 debug_print("[Schema] 模型路径已变更，缓存失效。")
+                return False
+            if data.get("lsh_threshold") != settings.lsh_threshold:
+                debug_print("[Schema] LSH 阈值变更，缓存失效。")
+                return False
+            if data.get("lsh_num_perm") != settings.lsh_num_perm:
+                debug_print("[Schema] LSH num_perm 变更，缓存失效。")
                 return False
             self.column_names = data["names"]
             self.exact_index = data["exact"]
