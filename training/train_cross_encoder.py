@@ -22,6 +22,15 @@ BASE_MODEL = str(settings.reranker_base_model)
 SAVE_PATH = str(settings.cross_encoder_model)
 
 
+def _get_use_amp_from_env() -> bool:
+    """
+    AMP 在部分环境下会触发 bfloat16 + GradScaler 的兼容性问题。
+    默认关闭，必要时可手动开启:
+      NL2SQL_CE_USE_AMP=1 python training/train_cross_encoder.py
+    """
+    return os.getenv("NL2SQL_CE_USE_AMP", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def train():
     if not os.path.isfile(TRAIN_FILE):
         print(f"[ERROR] 训练数据不存在: {TRAIN_FILE}，请先运行 prepare_data.py")
@@ -45,16 +54,27 @@ def train():
     loader = DataLoader(examples, shuffle=True, batch_size=16)
     epochs = 3
     warmup = int(len(loader) * epochs * 0.1)
+    use_amp = _get_use_amp_from_env()
 
     print(f"训练 {epochs} epochs，总步数 {len(loader) * epochs}")
-    model.fit(
+    print(f"AMP 混合精度: {'开启' if use_amp else '关闭'}")
+    fit_kwargs = dict(
         train_dataloader=loader,
         epochs=epochs,
         warmup_steps=warmup,
         output_path=SAVE_PATH,
-        use_amp=True,
+        use_amp=use_amp,
         show_progress_bar=True,
     )
+    try:
+        model.fit(**fit_kwargs)
+    except AttributeError as exc:
+        # sentence-transformers 与 transformers 版本不匹配时，
+        # CrossEncoderTrainer 可能缺少 _nested_gather；回退旧训练入口。
+        if "_nested_gather" not in str(exc):
+            raise
+        print("[WARN] 检测到 fit 版本兼容性问题，自动回退 old_fit 继续训练。")
+        model.old_fit(**fit_kwargs)
     model.save(SAVE_PATH)
     print(f"模型已保存: {SAVE_PATH}")
 
