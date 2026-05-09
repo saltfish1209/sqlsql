@@ -11,6 +11,10 @@ import math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_computation import EnhanceDataQueryBuilder
 from sql_generator import SQLQueryBuilder
+from multi_result_utils import (
+    MULTI_RESULT_SEP,
+    split_answer_template_top_level,
+)
 
 # 设置固定的随机种子
 SEED = 42
@@ -96,6 +100,18 @@ def extract(text: pd.DataFrame,q_col = '提问模版', a_col = '回答模版'):
 
 
 def extract_and_compute(row: pd.Series, template_row: pd.DataFrame, df_raw: pd.DataFrame,sql_conn, max_results: int = 50, q_col='提问模版', a_col='回答模版'):
+
+    # ─── 多结果回答模板分流 ───────────────────────────────────
+    # 支持 "count{},count1{中标签报号}" / "{供应商描述}, {中标签报号}" 这类
+    # 由顶层逗号并列的多个子模板。每个子模板独立计算 + 各自生成 SQL，
+    # 最后用 MULTI_RESULT_SEP 把多份结果拼回一个字段。
+    a_str_full = str(template_row[a_col].values[0]).strip()
+    sub_parts = split_answer_template_top_level(a_str_full)
+    if len(sub_parts) > 1:
+        return _extract_and_compute_multi(
+            row, template_row, df_raw, sql_conn, sub_parts,
+            max_results=max_results, q_col=q_col, a_col=a_col,
+        )
 
     sql_builder = SQLQueryBuilder(table_name='procurement_table')
 
@@ -384,6 +400,107 @@ def extract_and_compute(row: pd.Series, template_row: pd.DataFrame, df_raw: pd.D
     return py_final_data
 
 
+def _format_sub_answer(sub_result: dict) -> str:
+    """
+    把单个子结果格式化成字符串。规则与 get_multiple_filled_qa_pairs 中
+    单结果分支保持一致：
+      - 聚合 (count/sum/avg/count1) → 直接取 value
+      - 列表 (select/listdown/listup) → 行间 '，'，行内 '|'
+    """
+    agg = sub_result.get('aggregation')
+    rows_data = sub_result.get('results') or []
+    if agg:
+        if not rows_data:
+            return ""
+        return str(rows_data[0].get('value', ''))
+    cells = []
+    for row_dict in rows_data:
+        cells.append("|".join([str(v) for v in row_dict.values()]))
+    return "，".join(cells)
+
+
+def _extract_and_compute_multi(
+    row: pd.Series,
+    template_row: pd.DataFrame,
+    df_raw: pd.DataFrame,
+    sql_conn,
+    sub_parts: list,
+    max_results: int = 50,
+    q_col: str = '提问模版',
+    a_col: str = '回答模版',
+) -> dict:
+    """
+    顶层多结果回答模板的处理：对每个子模板递归调用 extract_and_compute，
+    分别得到 SQL / Pandas 校验值，最后用 MULTI_RESULT_SEP 拼回。
+
+    返回字典与单结果保持兼容，并额外携带：
+        aggregation = 'multi'
+        multi_results: list[sub_result_dict]
+    """
+    sub_results: list[dict] = []
+    sub_sqls: list[str] = []
+    sub_validations: list[str] = []
+    sub_py_reprs: list[str] = []
+    sub_sql_reprs: list[str] = []
+    sub_is_valid: list[bool] = []
+
+    for part in sub_parts:
+        # 构造一个只改了 a_col 的单行模板
+        sub_template_dict = template_row.iloc[0].to_dict()
+        sub_template_dict[a_col] = part
+        sub_template_row = pd.DataFrame([sub_template_dict])
+
+        sub_res = extract_and_compute(
+            row=row,
+            template_row=sub_template_row,
+            df_raw=df_raw,
+            sql_conn=sql_conn,
+            max_results=max_results,
+            q_col=q_col,
+            a_col=a_col,
+        )
+
+        if 'error' in sub_res:
+            return {"error": f"[子模板 '{part}'] {sub_res['error']}"}
+
+        sub_results.append(sub_res)
+        sub_sqls.append(sub_res.get('generated_sql', '') or '')
+        sub_validations.append(sub_res.get('sql_validation', '') or '')
+        sub_py_reprs.append(sub_res.get('py_value_repr', '') or '')
+        sub_sql_reprs.append(sub_res.get('sql_value_repr', '') or '')
+        sub_is_valid.append(bool(sub_res.get('is_valid', False)))
+
+    combined_sql = MULTI_RESULT_SEP.join(sub_sqls)
+
+    # SQL 校验：所有子 SQL 都 MATCH 才视为整体 MATCH，否则把不一致信息拼起来
+    if all(v == "MATCH" for v in sub_validations):
+        combined_validation = "MATCH"
+    else:
+        combined_validation = MULTI_RESULT_SEP.join(sub_validations)
+
+    combined_py_repr = MULTI_RESULT_SEP.join(sub_py_reprs)
+    combined_sql_repr = MULTI_RESULT_SEP.join(sub_sql_reprs)
+    combined_is_valid = all(sub_is_valid)
+
+    # base_conditions / multi_conditions 仅取第一个子结果（它们应一致），
+    # 用于上层日志展示，不影响 SQL 拼接。
+    head = sub_results[0] if sub_results else {}
+
+    return {
+        "base_conditions": head.get("base_conditions", {}),
+        "multi_conditions": head.get("multi_conditions", {}),
+        "results": [],                       # 单一 results 不再用，由上层走 multi_results
+        "aggregation": "multi",
+        "is_one_to_one": False,
+        "generated_sql": combined_sql,
+        "sql_validation": combined_validation,
+        "py_value_repr": combined_py_repr,
+        "sql_value_repr": combined_sql_repr,
+        "is_valid": combined_is_valid,
+        "multi_results": sub_results,        # 子结果原样保留，上层负责格式化
+    }
+
+
 def get_multiple_filled_qa_pairs(template_row: pd.DataFrame, df_raw: pd.DataFrame, sql_conn, num_samples: int = 10,
                                  max_retries_per_sample: int = 20, q_col = '提问模版', a_col = '回答模版'):
     """
@@ -449,8 +566,15 @@ def get_multiple_filled_qa_pairs(template_row: pd.DataFrame, df_raw: pd.DataFram
         # 计算答案
         result = extract_and_compute(row=sampled_row, template_row=template_row, df_raw=df_raw,sql_conn=sql_conn, q_col=q_col, a_col=a_col)
 
-        if 'error' not in result and result.get('results'):
-            if result['aggregation']:
+        # 是否多结果模板
+        is_multi_result = result.get('aggregation') == 'multi' and result.get('multi_results')
+        has_single_result = 'error' not in result and result.get('results')
+        if 'error' not in result and (is_multi_result or has_single_result):
+            if is_multi_result:
+                # 多结果：每个子模板各自格式化，再用 MULTI_RESULT_SEP 拼接
+                sub_answer_strs = [_format_sub_answer(sub) for sub in result['multi_results']]
+                answer = MULTI_RESULT_SEP.join(sub_answer_strs)
+            elif result['aggregation']:
                 answer = str(result['results'][0]['value'])
             else:
                 all_rows = []
