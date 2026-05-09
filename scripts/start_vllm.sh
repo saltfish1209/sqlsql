@@ -13,7 +13,7 @@ PORT="${VLLM_PORT:-8000}"
 HOST_BIND="${VLLM_HOST:-0.0.0.0}"
 GPU_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.72}"
 MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-6}"
-MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
+#MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 
 if [[ ! -d "$MODEL_PATH" ]]; then
   echo "[WARN] 模型目录不存在: $MODEL_PATH" >&2
@@ -31,7 +31,7 @@ echo "  --host              = $HOST_BIND"
 echo "  --port              = $PORT"
 echo "  --gpu-memory-util   = $GPU_MEM_UTIL"
 echo "  --max-num-seqs      = $MAX_NUM_SEQS"
-echo "  --max-model-len     = $MAX_MODEL_LEN"
+#echo "  --max-model-len     = $MAX_MODEL_LEN"
 echo ""
 echo "在另一个终端执行: source scripts/set_env.sh"
 echo ""
@@ -43,4 +43,3 @@ python -m vllm.entrypoints.openai.api_server \
   --port "$PORT" \
   --gpu-memory-utilization "$GPU_MEM_UTIL" \
   --max-num-seqs "$MAX_NUM_SEQS"\
-  --max-model-len "$MAX_MODEL_LEN"
