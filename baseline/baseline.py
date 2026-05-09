@@ -18,6 +18,7 @@ Baseline 系统 —— 单次直连 LLM 的最朴素 Text-to-SQL 流程。
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from openai import APIConnectionError
@@ -30,6 +31,10 @@ from pipeline.llm_client import create_async_client, get_model_name
 from pipeline.profiler import DatabaseProfiler
 from pipeline.schema_linker import SchemaLinker
 from pipeline.utils import TokenTracker, debug_print, to_halfwidth
+
+_SQL_SINGLE_QUOTE_LITERAL_RE = re.compile(r"'([^']*)'")
+_CJK_RE = r"\u4e00-\u9fff"
+_ASCII_WORD_RE = r"A-Za-z0-9"
 
 
 class BaselineSystem:
@@ -57,18 +62,14 @@ class BaselineSystem:
         self.llm_model = get_model_name()
         self.db_engine = DBEngine(csv_path, settings.table_name)
 
+        self.linker = SchemaLinker(schema_path, csv_path)
+        profiler = DatabaseProfiler(csv_path=csv_path)
+        self._profile_map = profiler.get_profile_map(profiler.profile_all())
+        self._all_columns = list(self.linker.column_names)
         if mode == "full":
-            with open(schema_path, "r", encoding="utf-8") as f:
-                self._full_schema_text = f.read()
-            self.linker = None
             self.entity_extractor = None
-            self._profile_map: dict[str, str] = {}
         else:
-            self.linker = SchemaLinker(schema_path, csv_path)
             self.entity_extractor = EntityExtractor(self.client, self.llm_model)
-            profiler = DatabaseProfiler(csv_path=csv_path)
-            self._profile_map = profiler.get_profile_map(profiler.profile_all())
-            self._full_schema_text = ""
 
         debug_print(f">>> [Baseline][{mode}] 初始化完成。\n")
 
@@ -76,10 +77,21 @@ class BaselineSystem:
 
     async def _build_schema_prompt(
         self, question: str, tracker: TokenTracker
-    ) -> str:
-        """根据当前模式构建喂给 LLM 的 Schema 文本。"""
+    ) -> tuple[str, list[str]]:
+        """根据当前模式构建喂给 LLM 的 Schema 文本，并返回提取实体。"""
         if self.mode == "full":
-            return self._full_schema_text
+            # full 模式：沿用与 pruned 一致的 M-Schema 格式，
+            # 仅将列集合替换为"全字段"以保持 baseline 的全量输入设定。
+            return (
+                SQLGenerator.build_m_schema_prompt(
+                    self._all_columns,
+                    self.linker.column_metadata,
+                    table_name=settings.table_name,
+                    randomize=False,
+                    profile_map=self._profile_map,
+                ),
+                [],
+            )
 
         # mode == "pruned"：复用主流程中得到的精简 Schema 逻辑
         # 等价于 pipeline.system._try_flow 的 tier1 (Top-K + must_have) 输入
@@ -98,29 +110,60 @@ class BaselineSystem:
         full_list = [x[0] for x in ranked]
         cols = list(set(full_list[:K]) | must_have)
 
-        return SQLGenerator.build_m_schema_prompt(
-            cols,
-            self.linker.column_metadata,
-            table_name=settings.table_name,
-            randomize=False,
-            profile_map=self._profile_map,
+        return (
+            SQLGenerator.build_m_schema_prompt(
+                cols,
+                self.linker.column_metadata,
+                table_name=settings.table_name,
+                randomize=False,
+                profile_map=self._profile_map,
+            ),
+            entities,
         )
 
     # ──────────── 主入口 ────────────
 
-    async def run_pipeline_async(self, question: str) -> dict:
+    @staticmethod
+    def _normalize_sql_literals(sql: str) -> str:
+        """轻量归一化生成 SQL：中文标点半角化 + 中英混排空格修正。"""
+        if not sql:
+            return sql
+        # 先做整句半角化：中文标点/全角符号 -> 英文半角符号
+        sql = to_halfwidth(sql)
+        # 修正标识符里的中英混排空格：计划批次 ID -> 计划批次ID
+        sql = re.sub(rf"(?<=[{_CJK_RE}])\s+(?=[{_ASCII_WORD_RE}])", "", sql)
+        sql = re.sub(rf"(?<=[{_ASCII_WORD_RE}])\s+(?=[{_CJK_RE}])", "", sql)
+
+        def _norm_match(m: re.Match[str]) -> str:
+            lit = to_halfwidth(m.group(1))
+            # ECP 招标合同 -> ECP招标合同, II 型 -> II型
+            lit = re.sub(rf"(?<=[{_ASCII_WORD_RE}])\s+(?=[{_CJK_RE}])", "", lit)
+            lit = re.sub(rf"(?<=[{_CJK_RE}])\s+(?=[{_ASCII_WORD_RE}])", "", lit)
+            return f"'{lit}'"
+
+        return _SQL_SINGLE_QUOTE_LITERAL_RE.sub(_norm_match, sql)
+
+    async def run_pipeline_async(self, question: str, *, enable_thinking: bool = False) -> dict:
         start = time.time()
         tracker = TokenTracker()
         question = to_halfwidth(question)
 
-        schema_prompt = await self._build_schema_prompt(question, tracker)
+        schema_prompt, entities = await self._build_schema_prompt(question, tracker)
 
         prompt = (
             f"你是一名SQL专家。请根据Schema为下列问题生成一条 SQLite SQL 查询。\n"
             f"采用 sqlite，不需要加上数据库名，直接使用对应表名即可。\n\n"
+            f"以问题信息为生成SQL主要条件，Schema提供辅助。\n"
+            f"不要添加除问题所给信息外多余的约束。\n"
             f"[Schema]\n{schema_prompt}\n"
+            f"[实体候选]\n{entities}\n"
             f"[用户问题]\n{question}\n"
-            f"请直接输出SQL，用```sql ... ```包裹，不需要思考过程、解释或其他内容。\n"
+            f"[硬性约束]\n"
+            f"1. WHERE/LIKE 中字符串字面量必须与问题或实体候选逐字符一致，不要改写空格和标点。\n"
+            f"2. SQL 关键字（SELECT/FROM/WHERE/AND/OR/JOIN/ON/DISTINCT/GROUP BY/ORDER BY/LIMIT 等）"
+            f"与列名、表名之间**必须有空格**分隔，禁止写成 `SELECT列名FROM` 这种无空格形式。\n"
+            f"3. 列名使用双引号包裹，如 `\"列名\"`。\n"
+            f"请直接输出SQL，用```sql ... ```包裹，不需要解释或其他内容。\n"
         )
 
         gen_start = time.time()
@@ -131,15 +174,15 @@ class BaselineSystem:
                 model=self.llm_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=settings.direct_temperature,
-                max_tokens=settings.max_gen_tokens,
+                # max_tokens=settings.max_gen_tokens,
                 timeout=settings.llm_request_timeout_sec,
                 stream=False,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
             )
             tracker.track(resp)
             content = resp.choices[0].message.content or ""
             debug_print(f"[Baseline][raw] {content!r}")
-            sql = SQLGenerator.extract_sql(content)
+            sql = self._normalize_sql_literals(SQLGenerator.extract_sql(content))
         except APIConnectionError as e:
             base_url = str(getattr(self.client, "base_url", "") or "?")
             print(
@@ -180,11 +223,12 @@ class BaselineSystem:
             "repair_times": [],
             "cost_time": time.time() - start,
             "token_usage": tracker.get_report(),
+            "entities": entities,
         }
 
-    async def run_pipeline(self, question: str) -> dict:
+    async def run_pipeline(self, question: str, *, enable_thinking: bool = True) -> dict:
         """别名，使其与 ``TextToSQLSystem.run_pipeline`` 接口对齐，供 evaluate 复用。"""
-        return await self.run_pipeline_async(question)
+        return await self.run_pipeline_async(question, enable_thinking=enable_thinking)
 
 
 # ──────────── CLI 入口 ────────────
@@ -201,12 +245,19 @@ if __name__ == "__main__":
         "--question", type=str,
         default='"协议库存可视化选购20230407"批次的采购实施模式是怎样的？',
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="启用 LLM 思考模式（enable_thinking）",
+    )
     args = parser.parse_args()
 
     system = BaselineSystem(mode=args.mode)
     loop = asyncio.get_event_loop()
     print("\n" + "=" * 60)
-    res = loop.run_until_complete(system.run_pipeline_async(args.question))
+    res = loop.run_until_complete(
+        system.run_pipeline_async(args.question, enable_thinking=args.enable_thinking)
+    )
     print(f"[Baseline][{args.mode}] Time: {res['cost_time']:.2f}s")
     print(f"SQL: {res['final_sql']}")
     tokens = res.get("token_usage", {})
