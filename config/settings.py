@@ -47,9 +47,9 @@ class Settings:
     cache_dir: Path = CACHE_DIR
 
     csv_path: Path = field(default_factory=lambda: DATA_DIR / "一次二次物料长描述2.csv")
-    schema_path: Path = field(default_factory=lambda: DATA_DIR / "m_schema.txt")
     schema_json_path: Path = field(default_factory=lambda: DATA_DIR / "m_schema.json")
-    qa_template_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_with_sql_template.csv")
+    schema_path: Path = field(default_factory=lambda: DATA_DIR / "m_schema.txt")
+    qa_template_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_template_only.csv")
     train_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_with_sql_and_slots.csv")
     table_name: str = "procurement_table"
 
@@ -73,22 +73,45 @@ class Settings:
         )
     )
 
-    # ── Schema Linking ──
-    top_k_embed: int = 40
-    # LSH 主阈值：从 0.75 → 0.45。
-    # 0.75 对"短名 vs 全名"（如 '珠海许继' vs '珠海许继电气有限公司'，char-Jaccard≈0.4）
-    # 一律拒收，导致 error.txt 案例 [19]/[24] 无法用 LSH 救回。
-    # 阈值降低后由 c_query_cover=0.88 等二级校验把关，避免误召回。
-    lsh_threshold: float = 0.45
-    lsh_num_perm: int = 128
+    # ── Retrieval-first schema linking ──
+    candidate_top_k: int = 20
+    candidate_value_top_k: int = 3
+    candidate_exact_bonus: float = 0.35
+    candidate_semantic_bonus: float = 0.25
+    candidate_fuzzy_bonus: float = 0.15
+    candidate_min_score: float = 0.18
+    candidate_max_columns: int = 18
+    lsh_threshold: float = 0.62
+    lsh_num_perm: int = 64
+    lsh_query_jaccard_threshold: float = 0.78
+    lsh_query_seq_ratio: float = 0.84
+    lsh_query_combined_threshold: float = 0.78
+    c_secondary_seq_ratio: float = 0.82
+    c_secondary_jaccard: float = 0.55
+    c_secondary_seq_with_jac: float = 0.62
+    c_query_cover: float = 0.45
+    lsh_query_jaccard_threshold: float = 0.78
+    lsh_query_seq_ratio: float = 0.84
+    lsh_query_seq_with_jac: float = 0.67
+    lsh_query_cover: float = 0.58
+    semantic_value_top_k: int = 5
+    semantic_value_threshold: float = 0.62
+    semantic_value_max_values_per_column: int = 200
+    enable_semantic_value_retrieval: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_SEMANTIC_VALUE_RETRIEVAL", "True").lower() == "true"
+    )
+    top_k_embed: int = 10
+    index_cache_dir: Path = field(default_factory=lambda: CACHE_DIR / "value_indexes")
 
-    # C路二级校验阈值
-    c_secondary_seq_ratio: float = 0.40
-    c_secondary_jaccard: float = 0.32
-    c_secondary_seq_with_jac: float = 0.26
-    c_query_cover: float = 0.88
+    # 轻量检索后，交给 LLM 做证据实体与字段分类时的上下文上限
+    evidence_schema_top_k: int = 10
+    evidence_entity_max_items: int = 8
+    evidence_json_max_tokens: int = 512
+    evidence_use_guided_json: bool = field(
+        default_factory=lambda: os.getenv("EVIDENCE_USE_GUIDED_JSON", "True").lower() == "true"
+    )
 
-    # ── Embedding ──
+    # ── Embedding / retrieval ──
     embed_query_prompt: str = (
         "Instruct: 给定一个关于数据库的自然语言问题，检索语义最相似的历史查询模板\n"
         "Query: "
@@ -96,89 +119,57 @@ class Settings:
 
     # ── Generator ──
     num_sql_per_path: int = 1
-    thinking_temperature: float = 0.5
+    icl_few_shot_k: int = field(
+        default_factory=lambda: int(os.getenv("ICL_FEW_SHOT_K", "3"))
+    )
     icl_temperature: float = 0.1
-    # 与 ICL 路温度 (0.1) 拉开差距，使 ICL/Direct 两条快路在自洽性投票中保留多样性，
-    # 避免 system._try_flow 早停 (两路一致即取消 thinking) 时退化为单路决策。
-    direct_temperature: float = 0.4
-    # 非思考路径的 max_tokens：SQL 本身很短，1024 足够
+    direct_temperature: float = 0.3
     max_gen_tokens: int = field(
         default_factory=lambda: int(os.getenv("LLM_MAX_GEN_TOKENS", "1024"))
-    )
-    # thinking_path 的 max_tokens：设 0 表示不限（不向 API 传 max_tokens）
-    thinking_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("THINKING_MAX_TOKENS", "0"))
     )
     llm_request_timeout_sec: int = field(
         default_factory=lambda: int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "180"))
     )
-    # 三路策略：
-    #   thinking_path 始终启用思考 (enable_thinking=True)
-    #   ICL / Direct 始终禁用思考 (enable_thinking=False)
-    # 通过 extra_body.chat_template_kwargs 传给 vLLM
     enable_thinking_for_entity: bool = field(
         default_factory=lambda: os.getenv("ENTITY_ENABLE_THINKING", "False").lower() == "true"
     )
     enable_thinking_for_refiner: bool = field(
         default_factory=lambda: os.getenv("REFINER_ENABLE_THINKING", "False").lower() == "true"
     )
+    baseline_enable_thinking: bool = field(
+        default_factory=lambda: os.getenv("BASELINE_ENABLE_THINKING", "False").lower() == "true"
+    )
 
-    # ── Entity Extraction ──
-    # 384 tokens 留给更长的 few-shot prompt 和 多实体 JSON 数组输出
+    # ── Entity / evidence extraction ──
     entity_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("ENTITY_MAX_TOKENS", "384"))
     )
-    # vLLM guided decoding：extra_body.guided_json，强制输出 JSON 数组
     entity_use_guided_json: bool = field(
         default_factory=lambda: os.getenv("ENTITY_USE_GUIDED_JSON", "True").lower() == "true"
     )
-    # 替模型开头：追加 assistant "[" + continue_final_message。
-    # 默认关闭：vLLM + Qwen3 + guided_json 同时启用时会出现 "]]" 等 schema 尾巴污染，
-    # 只用 guided_json 已经足够可靠。
     entity_prefix_bracket: bool = field(
         default_factory=lambda: os.getenv("ENTITY_PREFIX_BRACKET", "False").lower() == "true"
     )
 
-    # ── Refiner ──
+    # ── Refiner / selector ──
     max_repair_retries: int = 2
     refiner_temperature: float = 0.01
-    # Refiner 同样需要给 Qwen3 的 CoT 留空间
     refiner_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("REFINER_MAX_TOKENS", "2048"))
+        default_factory=lambda: int(os.getenv("REFINER_MAX_TOKENS", "1024"))
     )
-    # Refiner 不强制时间截停：max_tokens 已能自然限制生成长度
     refiner_enforce_timeout: bool = field(
         default_factory=lambda: os.getenv("REFINER_ENFORCE_TIMEOUT", "False").lower() == "true"
     )
-
-    # ── SQL Generator 可选的 assistant 前缀（默认关闭） ──
-    # 若开启：以 "```sql\n" 预填，强迫模型从 SQL 字面起笔
     generator_prefix_code_fence: bool = field(
         default_factory=lambda: os.getenv("GEN_PREFIX_CODE_FENCE", "False").lower() == "true"
     )
 
-    # ── Profiler (论文新增) ──
+    # ── Profiler ──
     profile_sample_rows: int = 100
     profile_distinct_threshold: int = 80
-    # 列基数 ≤ 该阈值时，profile 内联摘要中**枚举出全部取值**，
-    # 用于让 Generator 识别如 "招标模式 ∈ {总部直接组织实施, …}" 类细粒度过滤值
     profile_enum_full_threshold: int = 15
 
-    # ── Agentic 多步过滤抽取 (论文新增) ──
-    # 启用后会在 Generator 三路（thinking/icl/direct）之外增加一路 plan_path：
-    #   Step1  LLM 列出问题中的所有"过滤维度"（不输出 SQL）
-    #   Step2  逐条把维度对齐到具体列 + 字面量
-    #   Step3  LLM 拼装最终 SQL，并强制覆盖所有维度
-    # 用于解决"丢条件"类问题（error.txt 案例 [1] 物料编码 / [2] 物料小类描述）。
-    enable_plan_path: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_PLAN_PATH", "True").lower() == "true"
-    )
-    plan_path_temperature: float = 0.0
-
-    # —— Agentic 多子问题拆分（推理时） ——
-    # 当用户问题包含多个独立子问题（出现 ≥2 个 ?/？）时，先用 LLM 拆题，
-    # 再让流水线**逐题作答**，最后按 MULTI_RESULT_SEP 合并 final_sql / execution_result，
-    # 与生成端 `count{},count1{中标签报号}` 这种多结果模板的输出形态对齐。
+    # ── Flow control ──
     enable_question_split: bool = field(
         default_factory=lambda: os.getenv("ENABLE_QUESTION_SPLIT", "True").lower() == "true"
     )
@@ -190,8 +181,18 @@ class Settings:
 
     # ── 训练 ──
     train_split: float = 0.8
-    val_split: float = 0.1
-    test_split: float = 0.1
+    val_split: float = 0.0
+    test_split: float = 0.2
+    random_state: int = 42
+    # ── 调试 ──
+    debug_mode: bool = field(
+        default_factory=lambda: os.getenv("DEBUG_MODE", "True").lower() == "true"
+    )
+
+    # ── 训练 ──
+    train_split: float = 0.8
+    val_split: float = 0.0
+    test_split: float = 0.2
     random_state: int = 42
 
 

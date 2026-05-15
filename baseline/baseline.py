@@ -5,8 +5,8 @@ Baseline 系统 —— 单次直连 LLM 的最朴素 Text-to-SQL 流程。
         （与主流程完全一致，复用 ``pipeline.llm_client``）
 - Schema 模式：
     * mode="full"   ：直接把 ``data/m_schema.txt`` 全量 Schema 喂给 LLM
-    * mode="pruned" ：复用主流程中得到的精简 Schema
-                       （SchemaLinker 三路混合检索 + EntityExtractor + Profiler 注入）
+    * mode="pruned" ：只使用 ``EvidenceLinker`` 召回的精简候选 Schema
+                       （不注入证据实体，由消融实验决定是否启用）
 - 流程：单次 LLM 调用 → ``SQLGenerator.extract_sql`` 提取 SQL
         → ``DBEngine.execute_sql`` 执行 → 返回结果
 - 不含三路并发 / Refiner 修复 / Selector 投票 / Literal 校验，
@@ -25,11 +25,11 @@ from openai import APIConnectionError
 
 from config.settings import settings
 from pipeline.db_engine import DBEngine
+from pipeline.evidence_linker import EvidenceLinker
 from pipeline.entity_extractor import EntityExtractor
 from pipeline.generator import SQLGenerator
 from pipeline.llm_client import create_async_client, get_model_name
 from pipeline.profiler import DatabaseProfiler
-from pipeline.schema_linker import SchemaLinker
 from pipeline.utils import TokenTracker, debug_print, to_halfwidth
 
 _SQL_SINGLE_QUOTE_LITERAL_RE = re.compile(r"'([^']*)'")
@@ -62,7 +62,7 @@ class BaselineSystem:
         self.llm_model = get_model_name()
         self.db_engine = DBEngine(csv_path, settings.table_name)
 
-        self.linker = SchemaLinker(schema_path, csv_path)
+        self.linker = EvidenceLinker(schema_path, csv_path)
         profiler = DatabaseProfiler(csv_path=csv_path)
         self._profile_map = profiler.get_profile_map(profiler.profile_all())
         self._all_columns = list(self.linker.column_names)
@@ -93,22 +93,11 @@ class BaselineSystem:
                 [],
             )
 
-        # mode == "pruned"：复用主流程中得到的精简 Schema 逻辑
-        # 等价于 pipeline.system._try_flow 的 tier1 (Top-K + must_have) 输入
-        K = settings.top_k_embed
-        pre_ranked, _, _ = self.linker.hybrid_retrieve(question, [], top_k_embed=K)
-        pre_top_cols = [x[0] for x in pre_ranked[:K]]
-        entity_schema = self.linker.build_entity_schema(pre_top_cols)
-
-        entities = await self.entity_extractor.extract(
-            question, entity_schema, tracker,
-            schema_columns=self.linker.column_names,
-        )
-        ranked, must_have, _ = self.linker.hybrid_retrieve(
-            question, entities, top_k_embed=K
-        )
-        full_list = [x[0] for x in ranked]
-        cols = list(set(full_list[:K]) | must_have)
+        # mode == "pruned"：只做候选 schema 精简，不注入证据实体
+        candidate_pack = self.linker.retrieve(question, [])
+        cols = candidate_pack.selected_columns or [
+            c["field"] for c in candidate_pack.candidates[: settings.evidence_schema_top_k]
+        ]
 
         return (
             SQLGenerator.build_m_schema_prompt(
@@ -118,7 +107,7 @@ class BaselineSystem:
                 randomize=False,
                 profile_map=self._profile_map,
             ),
-            entities,
+            [],
         )
 
     # ──────────── 主入口 ────────────
@@ -174,7 +163,6 @@ class BaselineSystem:
                 model=self.llm_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=settings.direct_temperature,
-                # max_tokens=settings.max_gen_tokens,
                 timeout=settings.llm_request_timeout_sec,
                 stream=False,
                 extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
@@ -226,8 +214,10 @@ class BaselineSystem:
             "entities": entities,
         }
 
-    async def run_pipeline(self, question: str, *, enable_thinking: bool = True) -> dict:
+    async def run_pipeline(self, question: str, *, enable_thinking: bool | None = None) -> dict:
         """别名，使其与 ``TextToSQLSystem.run_pipeline`` 接口对齐，供 evaluate 复用。"""
+        if enable_thinking is None:
+            enable_thinking = settings.baseline_enable_thinking
         return await self.run_pipeline_async(question, enable_thinking=enable_thinking)
 
 

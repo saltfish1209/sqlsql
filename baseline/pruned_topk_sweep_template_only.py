@@ -6,6 +6,7 @@
 
     python baseline/pruned_topk_sweep_template_only.py
     DEBUG_MODE=False python baseline/pruned_topk_sweep_template_only.py --output baseline/topk_pruned_metrics.csv
+    python baseline/pruned_topk_sweep_template_only.py --concurrency 6
 
 说明：准确率与样本集合与 ``training.evaluate`` / ``baseline.evaluate --use-full-data`` 一致；
 Token 统计为每题 pipeline 汇总（pruned 含实体抽取 + SQL 生成等所有经 ``TokenTracker`` 的调用）。
@@ -46,45 +47,85 @@ def _load_full_match_df() -> pd.DataFrame | None:
     return df_full
 
 
-async def evaluate_one_pass(system: BaselineSystem, df: pd.DataFrame, *, verbose: bool) -> dict:
-    correct = 0
+async def evaluate_one_pass(
+    system: BaselineSystem,
+    df: pd.DataFrame,
+    *,
+    verbose: bool,
+    concurrency: int = 1,
+) -> dict:
     total = len(df)
-    sum_in = 0
-    sum_out = 0
-    sum_tot = 0
-    sum_first_infer = 0.0
-    sum_cost = 0.0
     has_gt_sql = "SQL语句" in df.columns
-
+    tasks: list[dict] = []
     for idx, row in df.iterrows():
-        question = str(row["生成问题"]).strip()
-        raw_gt = row["生成结果"]
+        tasks.append({
+            "idx": idx,
+            "question": str(row["生成问题"]).strip(),
+            "raw_gt": row["生成结果"],
+            "gt_sql": str(row["SQL语句"]).strip() if has_gt_sql else "",
+        })
 
-        try:
-            output = await system.run_pipeline(question)
-            tu = output.get("token_usage") or {}
-            tin = int(tu.get("input_tokens") or 0)
-            tout = int(tu.get("output_tokens") or 0)
-            ttot = int(tu.get("total_tokens") or (tin + tout))
-            sum_in += tin
-            sum_out += tout
-            sum_tot += ttot
-            sum_first_infer += float(output.get("first_inference_time", 0.0) or 0.0)
-            sum_cost += float(output.get("cost_time", 0.0) or 0.0)
+    results_map: dict[int, dict] = {}
+    semaphore = asyncio.Semaphore(max(1, concurrency))
 
-            gt_parsed = parse_ground_truth(raw_gt)
-            pred_parsed = normalize_execution_result(output.get("execution_result"))
-            if _compare_results(gt_parsed, pred_parsed):
-                correct += 1
-            elif verbose:
-                pred_sql = output.get("final_sql") or ""
-                gt_sql = str(row["SQL语句"]).strip() if has_gt_sql else ""
-                print(f"  [FAIL #{idx}] Q: {question[:80]}...")
-                print(f"    pred_sql: {pred_sql[:200]}...")
-                print(f"    gt_sql:   {gt_sql[:200]}...")
-        except Exception as e:
-            if verbose:
-                print(f"  [EXC #{idx}] {type(e).__name__}: {e}")
+    async def _run_one(t: dict) -> None:
+        idx = t["idx"]
+        question = t["question"]
+        raw_gt = t["raw_gt"]
+        gt_sql = t["gt_sql"]
+        async with semaphore:
+            try:
+                output = await system.run_pipeline(question)
+                tu = output.get("token_usage") or {}
+                tin = int(tu.get("input_tokens") or 0)
+                tout = int(tu.get("output_tokens") or 0)
+                ttot = int(tu.get("total_tokens") or (tin + tout))
+                first_infer = float(output.get("first_inference_time", 0.0) or 0.0)
+                cost = float(output.get("cost_time", 0.0) or 0.0)
+                gt_parsed = parse_ground_truth(raw_gt)
+                pred_parsed = normalize_execution_result(output.get("execution_result"))
+                ok = _compare_results(gt_parsed, pred_parsed)
+                if not ok and verbose:
+                    pred_sql = output.get("final_sql") or ""
+                    print(f"  [FAIL #{idx}] Q: {question[:80]}...")
+                    print(f"    pred_sql: {pred_sql[:200]}...")
+                    print(f"    gt_sql:   {gt_sql[:200]}...")
+                results_map[idx] = {
+                    "ok": ok,
+                    "tin": tin,
+                    "tout": tout,
+                    "ttot": ttot,
+                    "first_infer": first_infer,
+                    "cost": cost,
+                }
+            except Exception as e:
+                if verbose:
+                    print(f"  [EXC #{idx}] {type(e).__name__}: {e}")
+                results_map[idx] = {
+                    "ok": False,
+                    "tin": 0,
+                    "tout": 0,
+                    "ttot": 0,
+                    "first_infer": 0.0,
+                    "cost": 0.0,
+                }
+
+    if concurrency > 1:
+        print(f"[topk-sweep] 本轮并行: concurrency={concurrency}")
+    await asyncio.gather(*[_run_one(t) for t in tasks])
+
+    correct = 0
+    sum_in = sum_out = sum_tot = 0
+    sum_first_infer = sum_cost = 0.0
+    for idx in sorted(results_map.keys()):
+        r = results_map[idx]
+        if r["ok"]:
+            correct += 1
+        sum_in += r["tin"]
+        sum_out += r["tout"]
+        sum_tot += r["ttot"]
+        sum_first_infer += r["first_infer"]
+        sum_cost += r["cost"]
 
     n = total if total else 1
     return {
@@ -134,7 +175,9 @@ async def main_async(args: argparse.Namespace) -> None:
         settings.top_k_embed = k
         t0 = time.time()
         system = BaselineSystem(mode="pruned")
-        metrics = await evaluate_one_pass(system, df, verbose=args.verbose)
+        metrics = await evaluate_one_pass(
+            system, df, verbose=args.verbose, concurrency=args.concurrency,
+        )
         elapsed = time.time() - t0
         row = {
             "k": k,
@@ -143,7 +186,7 @@ async def main_async(args: argparse.Namespace) -> None:
         }
         rows.append(row)
         print(
-            f"[topk-sweep] k={k} acc={metrics['accuracy']:.4f} "
+            f"[topk-sweep] k={k} acc={metrics['accuracy']:.2f} "
             f"({metrics['correct']}/{metrics['total']}) "
             f"avg_tokens={metrics['avg_total_tokens']:.1f} "
             f"round_time={elapsed:.1f}s"
@@ -172,13 +215,19 @@ def main() -> None:
         ),
         help="输出 CSV 路径",
     )
-    p.add_argument("--k-min", type=int, default=52)
-    p.add_argument("--k-max", type=int, default=80)
-    p.add_argument("--k-step", type=int, default=2)
+    p.add_argument("--k-min", type=int, default=10)
+    p.add_argument("--k-max", type=int, default=70)
+    p.add_argument("--k-step", type=int, default=5)
     p.add_argument(
         "--verbose",
         action="store_true",
         help="打印错题与异常（否则仅每轮一行汇总）",
+    )
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="每轮评测内并行请求数（默认 1 串行；建议不超过 vLLM 的 max-num-seqs）",
     )
     args = p.parse_args()
     asyncio.run(main_async(args))

@@ -1,25 +1,20 @@
 """
-端到端评估脚本 —— 使用独立测试集评估 Text-to-SQL 准确率。
-───────────────────────────────────────────────────────────────
-数据切分与 prepare_data.py 完全一致 (80/10/10, random_state=42)，
-只使用最后 10% 作为测试集，避免数据泄露。
+Text-to-SQL evaluation for the retrieval-first pipeline.
 
-逐题打印：问题 / 模型实体 / 标准结果 / 模型结果 / 标准 SQL / 模型 SQL
-（无论 DEBUG_MODE 开关都会输出，便于错例排查。
-DEBUG_MODE 仍仅控制 pipeline 内部中间日志。）
-
-本模块对外暴露 ``run_evaluation(system, ...)``，
-任何提供 ``async run_pipeline(question)->dict`` 接口的系统都可复用此评估流程
-（例如 baseline/evaluate.py 复用同一套准确率计算与日志逻辑）。
+This script evaluates the end-to-end system on the MATCH subset of the training
+CSV. It prints per-sample logs and writes summary / error reports.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
+from collections import Counter
 import json
 import os
 import re
 import sys
 import time
+from pathlib import Path
 
 import pandas as pd
 
@@ -29,6 +24,7 @@ from generation.multi_result_utils import (
     MULTI_RESULT_SEP,
     split_multi_result_string,
 )
+from training.template_split import split_dataframe_by_template
 
 
 def is_float(s):
@@ -113,7 +109,7 @@ def parse_ground_truth(gt_str):
 
 
 def _normalize_single_result(result) -> set:
-    """单一执行结果（list[tuple]）→ set[str]。"""
+    """单一执行结果（list[tuple]）→ set[str]，并去掉重复行。"""
     if not result:
         return set()
     out: set[str] = set()
@@ -170,6 +166,57 @@ def _compare_results(gt, pred) -> bool:
     return gt == pred
 
 
+def _flatten_result_values(parsed) -> set[str]:
+    """Flatten parsed set/list[set] payload into a comparable string set."""
+    if isinstance(parsed, list):
+        out: set[str] = set()
+        for item in parsed:
+            if isinstance(item, set):
+                out.update(item)
+        return out
+    if isinstance(parsed, set):
+        return set(parsed)
+    return set()
+
+
+def classify_error_type(gt, pred, reason: str = "") -> tuple[str, str]:
+    """Classify an incorrect prediction for easier error analysis."""
+    reason = str(reason or "")
+    reason_lower = reason.lower()
+    sql_error_markers = (
+        "syntax",
+        "no such column",
+        "no such table",
+        "ambiguous",
+        "llm_error",
+        "llm_connection_error",
+        "empty_sql",
+        "all_paths_failed",
+    )
+    if any(m in reason_lower for m in sql_error_markers):
+        return "SQL_EXEC_ERROR", reason or "SQL execution or generation failed"
+
+    gt_is_list = isinstance(gt, list)
+    pred_is_list = isinstance(pred, list)
+    if gt_is_list != pred_is_list:
+        return "SHAPE_MISMATCH", "ground truth and prediction have different result shapes"
+
+    gt_flat = _flatten_result_values(gt)
+    pred_flat = _flatten_result_values(pred)
+
+    if not gt_flat and pred_flat:
+        return "EMPTY_GT", "ground truth is empty but prediction is non-empty"
+    if gt_flat and not pred_flat:
+        return "EMPTY_PRED", "prediction is empty"
+    if not gt_flat and not pred_flat:
+        return "UNKNOWN", "both normalized results are empty but comparison failed"
+
+    overlap = gt_flat & pred_flat
+    if overlap:
+        return "PARTIAL_MATCH", f"prediction overlaps ground truth but is incomplete/different ({len(overlap)} shared)"
+    return "VALUE_MISMATCH", "prediction and ground truth are non-empty but disjoint"
+
+
 def _stringify_for_log(parsed):
     """日志展示：把 set / list[set] 转成可读结构。"""
     if isinstance(parsed, list):
@@ -178,18 +225,25 @@ def _stringify_for_log(parsed):
 
 
 def _load_test_df() -> pd.DataFrame | None:
-    """与 prepare_data.py 完全一致的切分，仅返回最后 10% 测试集。"""
+    """Load the evaluation slice from the training CSV."""
     csv_path = str(settings.train_csv)
     if not os.path.isfile(csv_path):
-        print(f"[ERROR] 训练数据文件不存在: {csv_path}")
+        print(f"[ERROR] training data file not found: {csv_path}")
         return None
     df_full = pd.read_csv(csv_path)
-    df_full = df_full[df_full["SQL验证状态"] == "MATCH"].copy()
-    df_full = df_full.sample(frac=1, random_state=settings.random_state).reset_index(drop=True)
-    total_len = len(df_full)
-    val_end = int(total_len * (settings.train_split + settings.val_split))
-    df = df_full.iloc[val_end:].reset_index(drop=True)
-    print(f"总 MATCH 数据 {total_len} 条 → 测试集(后 {settings.test_split:.0%}): {len(df)} 条")
+    if "SQL验证状态" in df_full.columns:
+        df_full = df_full[df_full["SQL验证状态"] == "MATCH"].copy()
+    if "问题模版" in df_full.columns and not settings.train_split == 0.0:
+        _, _, df = split_dataframe_by_template(
+            df_full,
+            template_col="问题模版",
+            train_split=settings.train_split,
+            val_split=settings.val_split,
+        )
+    else:
+        df = df_full.copy()
+    df = df.reset_index(drop=True)
+    print(f"[Eval] loaded {len(df)} rows from {csv_path}")
     return df
 
 
@@ -255,13 +309,22 @@ async def run_evaluation(
                 pred_parsed = normalize_execution_result(output.get("execution_result"))
                 entities = output.get("entities") or []
                 pred_sql = output.get("final_sql") or ""
+                reason = str(output.get("reason") or "")
                 ok = _compare_results(gt_parsed, pred_parsed)
                 icon = "OK" if ok else "FAIL"
+                error_type = ""
+                error_detail = ""
+                if not ok:
+                    error_type, error_detail = classify_error_type(
+                        gt_parsed, pred_parsed, reason=reason
+                    )
 
                 completed[0] += 1
                 print(f"\n[{label}][{completed[0]}/{total}] {icon} | "
                       f"total={total_cost:.2f}s first_infer={first_infer:.2f}s "
                       f"repairs={repair_times}")
+                if not ok:
+                    print(f"  错误类型   : {error_type} ({error_detail})")
                 print(f"  问题      : {question}")
                 print(f"  实体/关键词: {entities}")
                 print(f"  正确结果   : {_stringify_for_log(gt_parsed)}")
@@ -281,6 +344,9 @@ async def run_evaluation(
                         "pred_parsed": _stringify_for_log(pred_parsed),
                         "is_multi": isinstance(gt_parsed, list),
                         "is_correct": ok,
+                        "error_type": error_type,
+                        "error_detail": error_detail,
+                        "reason": reason,
                     },
                     "first_infer": first_infer,
                     "total_cost": total_cost,
@@ -299,6 +365,8 @@ async def run_evaluation(
                         "id": idx, "question": question,
                         "gt_sql": gt_sql,
                         "error": str(e), "is_correct": False,
+                        "error_type": "EXCEPTION",
+                        "error_detail": f"{type(e).__name__}: {e}",
                     },
                     "first_infer": 0.0,
                     "total_cost": dt,
@@ -340,9 +408,11 @@ async def run_evaluation(
     print(f"[{label}] 平均首次推理耗时: {avg_first_infer:.2f}s")
     print(f"[{label}] 平均每次修正耗时: {avg_repair_each:.2f}s (共 {repair_rounds} 次修正)")
     print(f"[{label}] 平均总耗时: {avg_total:.2f}s")
-    print(f"[{label}] 评测总耗时: {eval_elapsed:.2f}s")
-
     err_logs = [l for l in logs if not l["is_correct"]]
+    error_type_counts = dict(Counter(l.get("error_type") or "UNKNOWN" for l in err_logs))
+    print(f"[{label}] 评测总耗时: {eval_elapsed:.2f}s")
+    print(f"[{label}] 错误类型统计: {error_type_counts}")
+
     if output_path is None:
         output_path = os.path.join(os.path.dirname(__file__), "error_analysis.json")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -362,6 +432,7 @@ async def run_evaluation(
         "evaluation_elapsed_time": eval_elapsed,
         "error_count": len(err_logs),
         "success_count": total - len(err_logs),
+        "error_type_counts": error_type_counts,
     }
     if full_output_path is None:
         full_output_path = os.path.join(os.path.dirname(__file__), "run_report.json")
@@ -386,10 +457,40 @@ async def run_evaluation(
     }
 
 
-async def main():
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="主流程 TextTo-SQL 端到端评估")
+    parser.add_argument(
+        "--eval-csv",
+        type=str,
+        default="",
+        help="评测 CSV 路径；缺省不改 settings.train_csv",
+    )
+    parser.add_argument(
+        "--use-full-data",
+        action="store_true",
+        help="使用 CSV 中全部 MATCH 行（train_split=val_split=0）",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="并行请求数（默认 1；建议不超过 vLLM max-num-seqs）",
+    )
+    args = parser.parse_args()
+    if args.eval_csv:
+        settings.train_csv = Path(args.eval_csv)
+    if args.use_full_data:
+        settings.train_split = 0.0
+        settings.val_split = 0.0
+
     from pipeline.system import TextToSQLSystem
+
     system = TextToSQLSystem()
-    await run_evaluation(system, label="full_pipeline")
+    await run_evaluation(
+        system,
+        label="full_pipeline",
+        concurrency=args.concurrency,
+    )
 
 
 if __name__ == "__main__":

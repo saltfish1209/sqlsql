@@ -10,6 +10,7 @@ DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
 
 sys.path.insert(0, os.path.normpath(os.path.join(BASE_DIR, "..")))
 from config.settings import settings
+from training.template_split import split_dataframe_by_template
 
 INPUT_CSV = os.path.join(DATA_DIR, "train_dataset_with_sql_and_slots.csv")
 INPUT_SCHEMA_FILE = os.path.join(DATA_DIR, "m_schema.json")
@@ -184,18 +185,13 @@ def main():
     match_len = len(df_filtered)
     print(f"过滤出 {match_len} 条有效 MATCH 数据。")
 
-    # 2. 随机打乱数据 (使用统一 random_state，与 cross_encoder 等保持一致)
-    df_filtered = df_filtered.sample(
-        frac=1, random_state=settings.random_state
-    ).reset_index(drop=True)
-
-    # 3. 动态切分数据 (使用统一的 train/val/test 比例)
-    train_end = int(match_len * settings.train_split)
-    val_end = int(match_len * (settings.train_split + settings.val_split))
-
-    df_train = df_filtered.iloc[:train_end]
-    df_val = df_filtered.iloc[train_end:val_end]
-    df_test = df_filtered.iloc[val_end:]
+    # 2. 按问题母版切分，保证扩展问题不会跨 train/test 泄漏。
+    df_train, df_val, df_test = split_dataframe_by_template(
+        df_filtered,
+        template_col="问题模版",
+        train_split=settings.train_split,
+        val_split=settings.val_split,
+    )
 
     print(f"开始处理训练集 ({len(df_train)} 行)...")
     train_data = process_dataframe(df_train, full_schema_meta, all_cols)

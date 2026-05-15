@@ -12,12 +12,12 @@ SERVED_NAME="${LLM_MODEL:-Qwen3.5-9B}"
 PORT="${VLLM_PORT:-8000}"
 HOST_BIND="${VLLM_HOST:-0.0.0.0}"
 GPU_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.72}"
-MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-6}"
+MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-25}"
 #MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 
-if [[ ! -d "$MODEL_PATH" ]]; then
-  echo "[WARN] 模型目录不存在: $MODEL_PATH" >&2
-  echo "请设置 VLLM_MODEL_PATH 指向本地模型目录。" >&2
+if [[ ! -e "$MODEL_PATH" ]]; then
+  echo "[WARN] 模型路径不存在: $MODEL_PATH" >&2
+  echo "请设置 VLLM_MODEL_PATH 指向本地模型目录或 GGUF 文件。" >&2
 fi
 
 export LLM_BASE_URL="http://127.0.0.1:${PORT}/v1"

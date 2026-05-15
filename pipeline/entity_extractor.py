@@ -1,461 +1,146 @@
-"""
-实体提取模块 —— 纯 LLM 提取 SQL WHERE 条件实体（规则兜底当前禁用）。
-──────────────────────────────────────────────────────────────
-核心改进:
-  1. extra_body.guided_json            —— 强制 LLM 输出合法 JSON 数组 (vLLM)
-  2. extra_body.chat_template_kwargs   —— 关闭 Qwen3 思考模式，减少 CoT 干扰
-  3. _clean_response 多策略解析         —— 括号配对 + 懒惰匹配 + 最外层兜底
-  4. 后置过滤                          —— 必须出现在原问题中（空白归一化对比），
-                                          且非 Schema 列名、非 prompt 回声
-"""
 from __future__ import annotations
 
 import json
 import re
-import time
 
 from openai import AsyncOpenAI, APIConnectionError
 
 from config.settings import settings
-from pipeline.utils import debug_print, TokenTracker
+from pipeline.utils import TokenTracker, debug_print
 
 
-def _describe_endpoint(client: AsyncOpenAI) -> str:
-    """从 openai AsyncOpenAI 实例上尽力取出 base_url，用于错误日志。"""
-    try:
-        return str(getattr(client, "base_url", "") or "?")
-    except Exception:
-        return "?"
-
-
-# JSON Schema：字符串数组
-_ENTITY_JSON_SCHEMA: dict = {
-    "type": "array",
-    "items": {"type": "string"},
+_ENTITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "提取实体": {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+    },
+    "required": ["提取实体"],
 }
-
-# prompt 中可能被 LLM 回声的噪声关键词，命中即剔除
-_PROMPT_NOISE_KEYWORDS = (
-    "JSON", "json", "数组", "输出", "示例", "规则", "当前任务",
-    "Few-Shot", "Schema", "schema",
-)
-
-# 单个实体最大长度（超长基本是 prompt 回声或 reasoning 文本）
-_MAX_ENTITY_LEN = 80
 
 
 class EntityExtractor:
-    """异步实体提取器。"""
+    """Extract evidence entity texts only."""
 
     def __init__(self, client: AsyncOpenAI, model: str):
         self.client = client
         self.model = model
 
-    # ──────────── 公开入口 ────────────
-
     async def extract(
         self,
         question: str,
-        schema_text: str,
+        candidate_schema_pack: dict,
         tracker: TokenTracker | None = None,
         max_retries: int = 2,
         schema_columns: list[str] | None = None,
     ) -> list[str]:
-        """LLM 实体提取 + 严格后置过滤。"""
+        schema_cols = schema_columns or []
+        schema_lines = []
+        candidates = candidate_schema_pack.get("召回schema") or candidate_schema_pack.get("Top20候选") or []
+        for c in candidates[: settings.evidence_schema_top_k]:
+            field_name = c.get("列名") or ""
+            field_desc = c.get("列描述") or ""
+            schema_lines.append(f"- 列名：{field_name}\n  列描述：{field_desc}")
+        schema_text = "\n".join(schema_lines)
         llm_entities = await self._llm_extract(question, schema_text, tracker, max_retries)
-
-        schema_col_set = set(schema_columns or [])
-        filtered_llm = self._post_filter(llm_entities, question, schema_col_set)
-
-        # ── 规则兜底已禁用 ──────────────────────────────────────────
-        # 如需重新启用，取消下面三段的注释即可。
-        #   1) 规则提取
-        #   2) 规则结果过滤
-        #   3) 与 LLM 结果合并
-        #
-        # rule_entities = self._rule_extract(question)
-        # filtered_rule = self._post_filter(rule_entities, question, schema_col_set)
-        # merged = list(dict.fromkeys(
-        #     filtered_llm + [e for e in filtered_rule if e not in filtered_llm]
-        # ))
-        # ───────────────────────────────────────────────────────────
-
-        merged = list(dict.fromkeys(filtered_llm))
-        debug_print(f"[Entity] LLM(raw)={llm_entities}")
-        debug_print(f"[Entity] LLM(filtered)={filtered_llm}  合并={merged}")
-        return merged
-
-    # ──────────── LLM 调用 ────────────
+        cleaned = self._post_filter(llm_entities, question, schema_cols)
+        debug_print(f"[Entity] raw={llm_entities}")
+        debug_print(f"[Entity] cleaned={cleaned}")
+        return cleaned
 
     async def _llm_extract(
-        self, question: str, schema_text: str,
-        tracker: TokenTracker | None, max_retries: int,
+        self,
+        question: str,
+        schema_text: str,
+        tracker: TokenTracker | None,
+        max_retries: int,
     ) -> list[str]:
-        system_msg = "你是一个电力物资采购数据库专家。只输出一个 JSON 字符串数组，不要输出任何其他内容。"
-        user_msg = f"""请严格从用户问题中提取**所有可作为 SQL WHERE 条件的业务实体值**，覆盖率优先。
+        system_msg = "你是一个数据库问题分析助手。只输出 JSON，不要输出任何其他内容。"
+        user_msg = f"""请从用户问题中抽取证据实体，只保留原始连续文本片段，不要改写，不要补全，不要解释。
 
-【数据库 Schema 摘要】
+【候选字段上下文】
 {schema_text}
 
-[抽取规则]
-1. 只能从用户问题中**逐字截取**子串，不允许改写、扩写或补全（"珠海许继"不要补成"珠海许继电气有限公司"）。
-2. 凡是可能出现在 WHERE 中的值都要抽，包括但不限于：
-   - 编号/编码：物料编码、订单号、申请号、供应商编码、项目编码（连续数字串或字母+数字）
-   - 公司/工厂/供应商名（含简称，如"珠海许继"、"宁波功成电气"、"长园深瑞继保"）
-   - 项目名/项目定义（含工程地块代号，如"DK20190039"）
-   - 批次/计划名（如"协议库存可视化选购20230407"、"2022年第四批电网项目协议库存执行计划"）
-   - 物料类目/规格（如"配电箱"、"10kV变压器"、"二次设备"、"4回路"）
-   - 招标 / 业务模式（如"总部直接组织实施"、"含税"）
-   - 时间限定（如"2023年"、"2月21号"）
-3. **不要漏抽**：哪怕是疑似的、看上去通用的词（"配电箱"、"含税"），只要可能用于过滤就要抽。宁多勿少。
-4. 同一类目里出现多个值时全部列出。
-5. 禁止输出列名、字段名、schema 描述、示例文字或任何解释。
-6. 必须返回标准 JSON 字符串数组：`["值1", "值2"]`；没有任何可抽取的就返回 `[]`。
+【抽取要求】
+1. 只抽与查询有关的原始文本片段。
+2. 宁可少抽，也不要切错。
+3. 不要输出字段名，不要输出编号，不要输出置信度。
+4. 只输出合法 JSON，且 JSON 字段名使用中文：
+{{"提取实体":["实体1","实体2"]}}
 
-[Few-Shot 示例]
-
-问题: 国家电网2022年第七十二批采购(输变电项目)有哪些？
-输出: ["国家电网2022年第七十二批采购(输变电项目)"]
-
-问题: 500061873物料的中标单位是谁？
-输出: ["500061873"]
-
-问题: 协议库存可视化选购20230407的详情
-输出: ["协议库存可视化选购20230407"]
-
-问题: 珠海许继的供应商编码是多少？
-输出: ["珠海许继"]
-
-问题: 宁波功成电气的采购申请号有哪些？
-输出: ["宁波功成电气"]
-
-问题: 仪征供电和长园深瑞继保合作的项目有哪些？
-输出: ["仪征供电", "长园深瑞继保"]
-
-问题: 苏州锦致那个DK20190039地块的局配工程中标日期有吗？
-输出: ["苏州锦致", "DK20190039", "局配工程"]
-
-问题: 扬州北辰的配电箱一共多少订单？
-输出: ["扬州北辰", "配电箱"]
-
-问题: 张家港供电公司总共下了多少采购订单（含税）？
-输出: ["张家港供电公司", "含税"]
-
-问题: 02J0工厂项目B210A023535Z里物料500136086的采购订单号是多少？
-输出: ["02J0", "B210A023535Z", "500136086"]
-
-问题: 2022年第四批电网协议库存中，户外4回路配电箱的中标单位是哪些？
-输出: ["2022年第四批电网协议库存", "户外", "4回路", "配电箱"]
-
-问题: 徐州供电公司/国网总部直接组织实施中标的供应商有哪些？
-输出: ["徐州供电公司/国网", "总部直接组织实施"]
-
-问题: 签订的合同中，物资大类名称为"二次设备"的订单有哪些？
-输出: ["二次设备"]
-
-[当前任务]
-问题: {question}
-输出:"""
-
+【当前问题】
+{question}
+"""
         for attempt in range(max_retries):
             try:
-                messages, extra_body, prefix = self._build_request(system_msg, user_msg)
-                call_start = time.time()
-                debug_print(
-                    f"[Entity] LLM 调用开始 (attempt={attempt + 1}/{max_retries}, "
-                    f"guided_json={settings.entity_use_guided_json}, "
-                    f"prefix_bracket={settings.entity_prefix_bracket})"
-                )
+                extra_body: dict = {}
+                if settings.evidence_use_guided_json:
+                    extra_body["guided_json"] = _ENTITY_SCHEMA
+                if not settings.enable_thinking_for_entity:
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
                 resp = await self.client.chat.completions.create(
                     model=self.model,
-                    messages=messages,
+                    messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                     temperature=0.0,
-                    max_tokens=settings.entity_max_tokens,
+                    max_tokens=settings.evidence_json_max_tokens,
                     timeout=settings.llm_request_timeout_sec,
                     extra_body=extra_body or None,
                 )
-                debug_print(
-                    f"[Entity] LLM 调用完成，耗时 {time.time() - call_start:.2f}s"
-                )
                 if tracker:
                     tracker.track(resp)
-
-                raw_content = resp.choices[0].message.content or ""
-                # ── 智能拼接 prefix ──
-                # 理想情况：continue_final_message 生效时，raw_content 是续写（以 "..."] 等开头）
-                # 实际情况：某些 vLLM 版本 / chat template 不认 continue_final_message，
-                #   模型会把预填的 "[" 当成独立 assistant 消息，又自己吐出完整 [...]。
-                # 若检测到 raw 已经以 '[' 开头，视作模型吐了完整数组，不再前置 prefix，
-                # 避免出现 [[...]] 的双层嵌套。
-                stripped = raw_content.lstrip()
-                if prefix and stripped.startswith("["):
-                    full_content = raw_content
-                else:
-                    full_content = prefix + raw_content
-
-                debug_print(
-                    f"[Entity][raw] {full_content!r}"
-                    if settings.debug_mode else ""
-                )
-
-                entities = self._clean_response(full_content)
-                if entities is not None:
-                    return entities
-                debug_print(
-                    f"  [Entity] 第{attempt+1}次响应解析失败，重试... "
-                    f"(raw_head: {full_content[:120]!r})"
-                )
-            except APIConnectionError as e:
-                # 网络层直接不通：重试也无济于事，立即中断
-                endpoint = _describe_endpoint(self.client)
-                print(
-                    f"[Entity][FATAL] 无法连接到 LLM 服务 (base_url={endpoint}, "
-                    f"model={self.model}): {e}\n"
-                    f"  ▶ 请检查:\n"
-                    f"    1. vLLM/Ollama 服务是否已启动并监听该端口\n"
-                    f"    2. 环境变量 LLM_BASE_URL / LLM_MODEL 是否正确\n"
-                    f"    3. 是否需要设置 NO_PROXY=127.0.0.1,localhost\n"
-                    f"    4. 服务启动日志中是否有 OOM / CUDA 错误"
-                )
+                raw = resp.choices[0].message.content or ""
+                data = self._parse_json(raw)
+                if data:
+                    return data
+            except APIConnectionError:
                 return []
             except Exception as e:
-                debug_print(f"  [Entity] 第{attempt+1}次调用异常: {type(e).__name__}: {e}")
-
-        debug_print("  [Entity] 所有重试均失败，返回空列表")
+                debug_print(f"[Entity] attempt={attempt + 1} error={type(e).__name__}: {e}")
         return []
 
-    # ──────────── 请求装配 ────────────
-
     @staticmethod
-    def _build_request(system_msg: str, user_msg: str) -> tuple[list[dict], dict, str]:
-        """
-        根据配置决定 messages / extra_body / 需要预填的字符串。
-        返回 (messages, extra_body, prefix_str)
-        """
-        messages: list[dict] = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ]
-        extra_body: dict = {}
-        prefix = ""
-
-        if settings.entity_use_guided_json:
-            # vLLM 原生参数；Ollama 等后端会静默忽略
-            extra_body["guided_json"] = _ENTITY_JSON_SCHEMA
-
-        # 实体提取不需要 CoT，通过 chat_template_kwargs 彻底关闭思考模式
-        if not settings.enable_thinking_for_entity:
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-
-        if settings.entity_prefix_bracket:
-            # 替模型开头，直接以 '[' 结尾的 assistant 消息强迫其续写数组内容
-            messages.append({"role": "assistant", "content": "["})
-            extra_body["continue_final_message"] = True
-            extra_body["add_generation_prompt"] = False
-            prefix = "["
-
-        return messages, extra_body, prefix
-
-    # ──────────── 响应清洗 ────────────
-
-    @staticmethod
-    def _clean_response(content: str) -> list[str] | None:
-        """
-        多策略解析：
-          策略 A —— 括号配对找第一个完整闭合的 `[...]` 子串（抗 `]]`, `[...][[`）
-          策略 B —— 懒惰匹配 `\[.*?\]`
-          策略 C —— 最外层 `[第一个 [` → `最后一个 ]`
-          每种策略都再经 "单引号→双引号、去尾逗号" 宽松修复后重试。
-        """
-        if not content:
-            return None
-        text = content.strip()
+    def _parse_json(text: str) -> list[str]:
+        if not text:
+            return []
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-
-        snippets: list[str] = []
-
-        # —— 策略 A：括号深度配对（关键兜底 `]]` 这种脏尾巴） ——
-        depth = 0
-        start = -1
-        for i, ch in enumerate(text):
-            if ch == "[":
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif ch == "]":
-                if depth > 0:
-                    depth -= 1
-                    if depth == 0 and start >= 0:
-                        snippets.append(text[start: i + 1])
-                        start = -1
-
-        # —— 策略 B：懒惰匹配的最小 `[...]` ——
-        for m in re.finditer(r"\[[^\[\]]*\]", text, re.DOTALL):
-            if m.group(0) not in snippets:
-                snippets.append(m.group(0))
-
-        # —— 策略 C：最外层（宽容模式） ——
-        lb = text.find("[")
-        rb = text.rfind("]")
-        if lb != -1 and rb != -1 and lb < rb:
-            outer = text[lb: rb + 1]
-            if outer not in snippets:
-                snippets.append(outer)
-
-        for snippet in snippets:
-            variants = [snippet]
-            # 宽松修复：单引号 → 双引号、去尾逗号
-            fixed = re.sub(r"(?<!\\)'", '"', snippet)
-            fixed = re.sub(r",\s*]", "]", fixed)
-            if fixed != snippet:
-                variants.append(fixed)
-            for var in variants:
-                try:
-                    result = json.loads(var)
-                except json.JSONDecodeError:
-                    continue
-                flat = EntityExtractor._flatten_string_list(result)
-                if flat is not None:
-                    return flat
-        return None
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return []
+        try:
+            obj = json.loads(m.group(0))
+        except Exception:
+            return []
+        ents = obj.get("提取实体") or obj.get("evidence_entities", []) if isinstance(obj, dict) else []
+        out: list[str] = []
+        for item in ents:
+            if not isinstance(item, str):
+                item = str(item)
+            item = item.strip()
+            if item:
+                out.append(item)
+        return out
 
     @staticmethod
-    def _flatten_string_list(obj) -> list[str] | None:
-        """
-        兼容三种情况：
-          ["a", "b"]          → ["a", "b"]
-          [["a", "b"]]        → ["a", "b"]   (双层嵌套)
-          [["a"], ["b"]]      → ["a", "b"]   (多个子数组)
-        非列表或无字符串 → None。
-        """
-        if not isinstance(obj, list):
-            return None
-        # 若单元素且其内部又是 list，向下剥一层
-        if len(obj) == 1 and isinstance(obj[0], list):
-            obj = obj[0]
-        flat: list[str] = []
-        for item in obj:
-            if isinstance(item, list):
-                for sub in item:
-                    if isinstance(sub, (str, int, float)):
-                        s = str(sub).strip()
-                        if s:
-                            flat.append(s)
-            elif isinstance(item, (str, int, float)):
-                s = str(item).strip()
-                if s:
-                    flat.append(s)
-        return flat if flat else None
-
-    # ──────────── 规则提取（当前未启用，保留以便日后回退） ────────────
-
-    @staticmethod
-    def _rule_extract(question: str) -> list[str]:
-        """
-        [DISABLED] 高置信度编码兜底提取。
-        当前流程中未被 `extract()` 调用；保留函数体供需要时一键复用。
-        只提取：**数字编码** 或 **字母+数字组合编码**。
-        不抓取中文、单纯字母单词、短数字（如年份 "2022"、量词 "3 个"）。
-        """
-        found: list[str] = []
-        # 连续的 ASCII 字母/数字 token，前后不得相邻字母数字（词边界）
-        for m in re.finditer(r"(?<![A-Za-z0-9])[A-Za-z0-9]+(?![A-Za-z0-9])", question):
-            token = m.group()
-            has_digit = any(ch.isdigit() for ch in token)
-            has_alpha = any(ch.isalpha() for ch in token)
-            if not has_digit:
-                continue
-            if not has_alpha and len(token) < 6:
-                continue
-            if has_alpha and len(token) < 3:
-                continue
-            if token not in found:
-                found.append(token)
-        return found
-
-    # ──────────── 后置过滤 ────────────
-
-    @staticmethod
-    def _normalize_ws(s: str) -> str:
-        """去掉所有空白字符，消除 Qwen tokenizer 在中文+数字边界插入的伪空格。"""
+    def _normalize(s: str) -> str:
         return re.sub(r"\s+", "", s)
 
-    @staticmethod
-    def _post_filter(
-        entities: list[str],
-        question: str,
-        schema_cols: set[str],
-    ) -> list[str]:
-        """
-        实体必须是原问题中出现过的子串；同时剔除 Schema 列名和 prompt 回声。
-
-        对比时做空白归一化：
-          LLM 返回 "协议库存可视化选购 20230407" 也算匹配 "协议库存可视化选购20230407"。
-          返回值使用归一化后的形式（无空格），保证与数据库中实际存储的值对齐。
-        """
-        q_norm = EntityExtractor._normalize_ws(question)
-        schema_norm = {EntityExtractor._normalize_ws(c) for c in schema_cols}
-
-        cleaned: list[str] = []
+    def _post_filter(self, entities: list[str], question: str, schema_cols: list[str]) -> list[str]:
+        q_norm = self._normalize(question)
+        schema_norm = {self._normalize(c) for c in schema_cols}
         seen: set[str] = set()
-        for raw in entities:
-            if not isinstance(raw, str):
+        cleaned: list[str] = []
+        for ent in entities:
+            text = self._normalize(str(ent).strip().strip("，,。.；;:：\"'`"))
+            if not text or text in seen:
                 continue
-            e = raw.strip().strip("，,。.；;:：\"'`")
-            if not e or len(e) > _MAX_ENTITY_LEN:
+            if text in schema_norm:
                 continue
-            # 归一化：去空白后再判断（核心修复点）
-            e_norm = EntityExtractor._normalize_ws(e)
-            if not e_norm:
+            if text not in q_norm:
                 continue
-            if e_norm in seen:
-                continue
-            if any(kw in e_norm for kw in _PROMPT_NOISE_KEYWORDS):
-                continue
-            if e_norm in schema_norm:
-                continue
-            if e_norm not in q_norm:
-                continue
-            cleaned.append(e_norm)
-            seen.add(e_norm)
-        return EntityExtractor._suppress_over_split(cleaned)
-
-    @staticmethod
-    def _suppress_over_split(entities: list[str], max_keep: int = 4) -> list[str]:
-        """
-        抑制“一个复合实体被过度切分成多个碎片”的情况，尽量最小影响召回：
-        1) 若 A 是 B 的子串且显著更短，则优先保留更长的 B；
-        2) 编码类实体（纯数字 / 字母数字混合）优先保留；
-        3) 最多保留 max_keep 个，避免关键词过多导致检索发散。
-        """
-        if len(entities) <= 1:
-            return entities
-
-        def _is_code_like(s: str) -> bool:
-            has_digit = any(ch.isdigit() for ch in s)
-            has_alpha = any(ch.isalpha() for ch in s)
-            return has_digit and (has_alpha or len(s) >= 6)
-
-        # 先按长度降序，确保“长实体优先”
-        sorted_entities = sorted(entities, key=len, reverse=True)
-        kept: list[str] = []
-        for e in sorted_entities:
-            drop = False
-            for k in kept:
-                # e 是已保留长实体 k 的明显子串（并且短很多）→ 视作过切分噪声
-                if e in k and len(e) <= max(4, int(len(k) * 0.55)):
-                    # 但编码类短实体仍保留（如 10kV / KSH0000749）
-                    if not _is_code_like(e):
-                        drop = True
-                        break
-            if not drop:
-                kept.append(e)
-
-        # 编码类优先，其次长度优先；最后做数量上限
-        kept = sorted(
-            kept,
-            key=lambda x: (0 if _is_code_like(x) else 1, -len(x)),
-        )[:max_keep]
-        return kept
+            seen.add(text)
+            cleaned.append(text)
+            if len(cleaned) >= settings.evidence_entity_max_items:
+                break
+        return cleaned

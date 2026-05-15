@@ -73,25 +73,23 @@ class ColumnProfile:
     def to_inline_summary(self) -> str:
         """
         生成内联摘要（不含列名），直接拼接到 schema 字段描述末尾。
-        始终输出类型 + 示例值（至少 2 个，已在 _profile_column 中补齐）。
+        始终输出类型 + 是否枚举 + 示例值（至少 2 个，已在 _profile_column 中补齐）。
         - 低基数枚举列（distinct ≤ enum_full_threshold）会**全部列出取值**，
           这样 Generator 才能识别到 "招标模式 ∈ {总部直接组织实施, 公司集中招标, …}" 这类
           细粒度过滤值（error.txt 案例 17 的根因）。
         - 数值列额外附加范围。空值率偏高时额外提示。
         """
         parts: list[str] = []
-        parts.append(f"类型={self.dtype_inferred}")
+        parts.append(f"字段类型={self.dtype_inferred}")
         if self.null_ratio > 0.3:
             parts.append(f"空值率={self.null_ratio:.0%}")
-        # 低基数枚举：列出全部取值（避免示例只覆盖 2~6 个）
         full_threshold = settings.profile_enum_full_threshold
-        if (
-            self.is_categorical
-            and 1 < self.distinct_count <= full_threshold
-            and self.top_values
-        ):
-            all_vals = [v for v, _ in self.top_values[: full_threshold]]
-            parts.append(f"枚举值={'/'.join(all_vals)}")
+        if self.distinct_count <= full_threshold and self.top_values:
+            all_vals = [v for v, _ in self.top_values[: self.distinct_count]]
+            if 1 < self.distinct_count:
+                parts.append(f"枚举值={'/'.join(all_vals)}")
+            elif self.sample_values:
+                parts.append(f"示例={'/'.join(self.sample_values)}")
         elif self.sample_values:
             parts.append(f"示例={'/'.join(self.sample_values)}")
         if self.dtype_inferred == "NUMERIC" and self.min_val is not None and self.max_val is not None:
@@ -152,6 +150,17 @@ class DatabaseProfiler:
             profiles.append(self._profile_column(col))
         debug_print(f"[Profiler] 完成 {len(profiles)} 列的自动 Profiling")
         return profiles
+
+    def get_profile_detail_map(self, profiles: list[ColumnProfile] | None = None) -> dict[str, dict]:
+        if profiles is None:
+            profiles = self.profile_all()
+        detail: dict[str, dict] = {}
+        for p in profiles:
+            detail[p.name] = {
+                "字段类型": p.dtype_inferred,
+                "枚举值": [v for v, _ in p.top_values] if p.distinct_count <= settings.profile_enum_full_threshold else [],
+            }
+        return detail
 
     def _profile_column(self, col: str) -> ColumnProfile:
         p = ColumnProfile(col)
@@ -236,6 +245,12 @@ class DatabaseProfiler:
         if profiles is None:
             profiles = self.profile_all()
         return {p.name: p.to_inline_summary() for p in profiles}
+
+    def get_profile_name_map(self, profiles: list[ColumnProfile] | None = None) -> dict[str, ColumnProfile]:
+        """返回 {列名: ColumnProfile}，便于读取类型/枚举标记等结构化信息。"""
+        if profiles is None:
+            profiles = self.profile_all()
+        return {p.name: p for p in profiles}
 
     def get_categorical_values(self, profiles: list[ColumnProfile] | None = None) -> dict[str, list[str]]:
         """返回所有分类列的合法值列表，供 Refiner 做 Literal 校验。"""

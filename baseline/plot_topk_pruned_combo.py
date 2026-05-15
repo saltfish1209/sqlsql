@@ -4,12 +4,16 @@ from matplotlib import font_manager, rcParams
 
 
 def _setup_chinese_font():
-    """优先使用 Windows 常见中文字体，避免中文乱码。"""
+    """优先使用 Windows / Linux 常见中文字体，避免中文乱码。"""
     preferred_fonts = [
         "Microsoft YaHei",
         "SimHei",
         "Microsoft JhengHei",
         "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "WenQuanYi Micro Hei",
+        "WenQuanYi Zen Hei",
+        "Droid Sans Fallback",
     ]
     installed = {f.name for f in font_manager.fontManager.ttflist}
     for name in preferred_fonts:
@@ -22,8 +26,8 @@ def _setup_chinese_font():
 
 
 def main():
-    input_csv = r"c:\Users\yinjun\Desktop\nl2sql\baseline\topk_pruned_metrics1.csv"
-    output_png = r"c:\Users\yinjun\Desktop\nl2sql\baseline\topk_pruned_combo_chart.png"
+    input_csv = r"/home/xs-a100/yj/nl2sql/baseline/topk_pruned_metrics.csv"
+    output_png = r"/home/xs-a100/yj/nl2sql/baseline/topk_pruned_combo_chart.png"
 
     _setup_chinese_font()
 

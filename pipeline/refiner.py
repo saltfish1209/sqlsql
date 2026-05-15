@@ -1,65 +1,14 @@
-"""
-SQL 精炼器 —— 执行反馈驱动的多轮自修正 + Literal-Column 校验。
-───────────────────────────────────────────────────────────────────
-1. 预检：直接执行候选 SQL，成功即跳过修复
-2. 修复循环：每轮把错误反馈注入 Prompt，让 LLM 修正
-3. Literal-Column 校验（论文新增）：
-   检查 WHERE 中的字面量是否真实存在于对应列，
-   若不存在则提示 LLM 修正为 LIKE 或替换值
-
-项目特色：平票按路径优先级决策 (thinking > ICL > direct)，不调用 LLM。
-"""
 from __future__ import annotations
 
-import asyncio
-import re
-import time
-from collections import Counter
+import json
 
 from openai import AsyncOpenAI, APIConnectionError
 
 from config.settings import settings
+from pipeline.checkers import SQLCheckerChain, CheckIssue
 from pipeline.db_engine import DBEngine
 from pipeline.generator import SQLGenerator
-from pipeline.utils import debug_print, TokenTracker
-
-
-def _result_key(result) -> str:
-    """把执行结果折叠成可哈希的字符串键，用于多路投票一致性比较。"""
-    if result is None:
-        return "<NONE>"
-    try:
-        # 归一化：顺序不同但集合相同也视作一致
-        return str(sorted([tuple(r) for r in result]))
-    except Exception:
-        return str(result)
-
-
-def majority_agreed(successful: list[dict]) -> bool:
-    """至少两路成功且存在一对结果完全一致，则投票已锁定。
-
-    暴露为模块级公共函数，供 ``pipeline.system._try_flow`` 在收到快路结果后
-    判断是否可以提前取消 thinking 路。
-    """
-    if len(successful) < 2:
-        return False
-    counts = Counter(_result_key(c.get("result")) for c in successful)
-    return max(counts.values()) >= 2
-
-
-# 旧的下划线版保持别名，兼容潜在外部引用。
-_majority_agreed = majority_agreed
-
-
-def _extract_where_literals(sql: str) -> list[tuple[str, str]]:
-    """从 SQL 中提取 WHERE 子句中的 (列名, 字面量) 对。"""
-    pairs = []
-    # "col" = 'val'  或  col = 'val'
-    for m in re.finditer(
-        r'"?([^"=\s]+)"?\s*=\s*\'([^\']+)\'', sql
-    ):
-        pairs.append((m.group(1).strip(), m.group(2).strip()))
-    return pairs
+from pipeline.utils import TokenTracker, debug_print
 
 
 class SQLRefiner:
@@ -67,6 +16,7 @@ class SQLRefiner:
         self.client = client
         self.model = model
         self.db = db
+        self.checker = SQLCheckerChain(db)
 
     async def refine_async(
         self,
@@ -77,149 +27,112 @@ class SQLRefiner:
         tracker: TokenTracker,
         max_retries: int | None = None,
     ) -> list[dict]:
-        retries = max_retries or settings.max_repair_retries
         refined = []
-        need_repair = []
-
         for cand in candidates:
-            result, error = self.db.execute_sql(cand["sql"])
-            if error is not None:
-                cand["error_msg"] = error
-                need_repair.append(cand)
-                continue
-            # 执行成功：即便结果为空或 NULL 也视为合法业务结果，不再算运行错误。
-            # 仅当 WHERE 字面量确实与列不匹配时，才进入修复（改 LIKE）。
-            literal_issues = self._check_literals(cand["sql"]) if result else []
-            if literal_issues:
-                cand["error_msg"] = f"LITERAL_MISMATCH: {literal_issues}"
-                need_repair.append(cand)
-            else:
-                cand["status"] = "success"
-                cand["result"] = result if result is not None else []
-                refined.append(cand)
-
-        if not need_repair:
-            return refined
-
-        # 早停：按投票一致性，若已有两路成功且结果一致，
-        # 无论剩余路是否出错都不再修复——第三路正确与否不影响多数票。
-        if majority_agreed(refined):
-            debug_print(
-                f"[Refiner] 已有 {len(refined)} 路结果一致，跳过 {len(need_repair)} 个修复任务"
+            repaired = dict(cand)
+            result, error = self.db.execute_sql(repaired["sql"])
+            issues = self.checker.check(
+                repaired["sql"],
+                result=result if error is None else None,
+                execution_error=error,
             )
-            return refined
-
-        debug_print(f"[Refiner] 启动修正，需修复: {len(need_repair)} 个")
-        tasks = [
-            self._repair_worker(question, schema_prompt, c, valid_columns, tracker, retries)
-            for c in need_repair
-        ]
-        repaired = await asyncio.gather(*tasks)
-        refined.extend(repaired)
+            if issues:
+                repaired["checker_issues"] = issues
+                repaired["error_msg"] = self._format_checker_feedback(issues)
+                repaired.setdefault("result", None)
+                repaired["status"] = "needs_repair"
+                repaired = await self._attempt_llm_repair(
+                    question=question,
+                    schema_prompt=schema_prompt,
+                    candidate=repaired,
+                    valid_columns=valid_columns,
+                    tracker=tracker,
+                    max_retries=max_retries or settings.max_repair_retries,
+                )
+                refined.append(repaired)
+            else:
+                repaired["status"] = "success"
+                repaired["result"] = result if result is not None else []
+                refined.append(repaired)
         return refined
 
-    async def _repair_worker(
+    @staticmethod
+    def _format_checker_feedback(issues: list[CheckIssue]) -> str:
+        return "\n".join(
+            f"{issue.code}: {issue.message} 修复建议: {issue.directive}"
+            for issue in issues
+        )
+
+    async def _attempt_llm_repair(
         self,
         question: str,
         schema_prompt: str,
-        cand: dict,
-        valid_cols: list[str],
+        candidate: dict,
+        valid_columns: list[dict] | list[str],
         tracker: TokenTracker,
         max_retries: int,
     ) -> dict:
-        current_sql = cand["sql"]
-        current_error = cand["error_msg"]
-        valid_cols_str = ", ".join(valid_cols)
-        repair_times: list[float] = []
-
-        for i in range(max_retries):
-            t_repair_start = time.time()
-            system_msg = "你是 SQLite 修复专家。只输出修复后的 SQL，不要输出任何解释或其他内容。"
-            user_msg = (
-                f"【Schema】\n{schema_prompt}\n"
-                f"【合法列名】{valid_cols_str}\n"
-                f"【问题】{question}\n"
-                f"【错误SQL】\n{current_sql}\n"
-                f"【执行反馈】{current_error}\n"
-                f"【修复规则】\n"
-                f"1. 修正列名错误 (no such column)，只能使用合法列名列表中的列。\n"
-                f"2. 补全不完整的 SELECT-FROM-WHERE 结构。\n"
-                f"3. 字面量不存在 (LITERAL_MISMATCH) 时：把 `=` 改成 `LIKE '%X%'`，"
-                f"或换到 schema 证据中提示的真实列。\n"
-                f"4. 所有字面量必须用单引号包裹，编号 / 编码字段也是。\n"
-                f"5. SELECT 业务实体时 WHERE 末尾追加 `AND \"目标列\" != '' "
-                f"AND \"目标列\" IS NOT NULL`。\n"
-                f"直接输出修复后的 SQL，用```sql ... ```包裹，不要思考过程。"
+        sql = candidate.get("sql") or ""
+        prompt_schema = self._format_schema_prompt(schema_prompt, valid_columns)
+        prompt = (
+            "你是SQL修复专家。请根据错误SQL、错误原因和精简schema重新生成正确SQL。\n"
+            f"[问题]\n{question}\n"
+            f"[错误SQL]\n{sql}\n"
+            f"[错误原因]\n{candidate.get('error_msg', '')}\n"
+            f"[精简schema]\n{prompt_schema}\n"
+            "要求：只输出可执行SQL，用```sql包裹。"
+        )
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=settings.refiner_temperature,
+                timeout=settings.llm_request_timeout_sec,
+                max_tokens=settings.refiner_max_tokens,
+                extra_body={"chat_template_kwargs": {"enable_thinking": settings.enable_thinking_for_refiner}},
             )
-            try:
-                extra_body: dict = {}
-                if not settings.enable_thinking_for_refiner:
-                    extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-                create_kwargs = dict(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    temperature=settings.refiner_temperature,
-                    max_tokens=settings.refiner_max_tokens,
-                    extra_body=extra_body or None,
+            tracker.track(resp)
+            content = resp.choices[0].message.content or ""
+            sql2 = SQLGenerator.extract_sql(content)
+            candidate["sql"] = sql2 or sql
+            result, error = self.db.execute_sql(candidate["sql"])
+            candidate["result"] = result if error is None else None
+            candidate["checker_issues"] = self.checker.check(candidate["sql"], result=result if error is None else None, execution_error=error)
+            if not candidate["checker_issues"]:
+                candidate["status"] = "success"
+                candidate.pop("error_msg", None)
+            else:
+                candidate["status"] = "needs_repair"
+            return candidate
+        except Exception:
+            return candidate
+
+    @staticmethod
+    def _format_schema_prompt(schema_prompt: str, valid_columns: list[dict] | list[str]) -> str:
+        if valid_columns and isinstance(valid_columns[0], dict):
+            lines = []
+            for col in valid_columns:
+                lines.append(
+                    f'- 列名：{col.get("列名", "")} | 相关性分数：{col.get("相关性分数", "")} | 列描述：{col.get("列描述", "")} | 字段类型：{col.get("字段类型", "")} | 是否枚举：{col.get("是否枚举", "")}'
                 )
-                if settings.refiner_enforce_timeout:
-                    create_kwargs["timeout"] = settings.llm_request_timeout_sec
-                resp = await self.client.chat.completions.create(**create_kwargs)
-                tracker.track(resp)
-                content = resp.choices[0].message.content
-                debug_print(f"[Refiner][raw][{cand['type']}] {content!r}")
-                fixed_sql = SQLGenerator.extract_sql(content)
-
-                result, error = self.db.execute_sql(fixed_sql)
-                repair_times.append(time.time() - t_repair_start)
-                # 修复后只要无执行错误即接受（空结果 / NULL 均视为合法业务结果）
-                if error is None:
-                    debug_print(f"[Refiner] {cand['type']} 第{i+1}次修正成功")
-                    return {
-                        "type": f"{cand['type']}_Refined_{i + 1}",
-                        "sql": fixed_sql,
-                        "status": "success",
-                        "result": result if result is not None else [],
-                        "repair_times": repair_times,
-                    }
-                current_sql = fixed_sql
-                current_error = error
-            except APIConnectionError as e:
-                repair_times.append(time.time() - t_repair_start)
-                base_url = str(getattr(self.client, "base_url", "") or "?")
-                print(
-                    f"[Refiner][FATAL] 无法连接 LLM 服务 "
-                    f"(base_url={base_url}, model={self.model}): {e}"
-                )
-                break
-            except Exception as e:
-                repair_times.append(time.time() - t_repair_start)
-                debug_print(f"[Refiner] 修复异常: {type(e).__name__}: {e}")
-
-        return {
-            "type": cand["type"],
-            "sql": current_sql,
-            "status": "failed",
-            "error_msg": current_error,
-            "result": None,
-            "repair_times": repair_times,
-        }
-
-    def _check_literals(self, sql: str) -> list[str]:
-        """Literal-Column 校验：检查 WHERE 中的字面量是否存在于对应列。"""
-        issues = []
-        for col, literal in _extract_where_literals(sql):
-            if not self.db.check_literal_in_column(col, literal):
-                issues.append(f"'{literal}' 不存在于列 '{col}'")
-        return issues
+                if col.get("空值率") not in (None, ""):
+                    lines.append(f'  空值率：{col.get("空值率")}')
+                if col.get("唯一值数") not in (None, ""):
+                    lines.append(f'  唯一值数：{col.get("唯一值数")}')
+                if col.get("示例值") not in (None, ""):
+                    lines.append(f'  示例值：{col.get("示例值")}')
+                if col.get("格式") not in (None, ""):
+                    lines.append(f'  格式：{col.get("格式")}')
+                if col.get("范围") not in (None, ""):
+                    lines.append(f'  范围：{col.get("范围")}')
+            return "\n".join(lines)
+        if isinstance(valid_columns, list):
+            return json.dumps(valid_columns, ensure_ascii=False, indent=2)
+        return str(schema_prompt)
 
     @staticmethod
     def resolve_tie(tie_candidates: list[dict]) -> dict:
-        """平票决策：thinking > ICL > direct，无需 LLM 调用。"""
-        priority_order = ["thinking", "icl", "direct"]
+        priority_order = ["json_sql", "icl", "direct", "plan"]
         for priority in priority_order:
             for cand in tie_candidates:
                 if priority in cand.get("type", "").lower():

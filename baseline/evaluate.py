@@ -5,8 +5,8 @@ Baseline 评估脚本 —— 复用 ``training.evaluate.run_evaluation``。
 保证与主流程的对比公平。
 
 用法:
-    DEBUG_MODE=True python baseline/evaluate.py --mode full --use-full-data
-    DEBUG_MODE=True  python baseline/evaluate.py --mode pruned --use-full-data
+    python baseline/evaluate.py --mode full --use-full-data --concurrency 4
+    python baseline/evaluate.py --mode pruned --use-full-data --concurrency 15 --enable-thinking
 """
 from __future__ import annotations
 
@@ -48,14 +48,28 @@ async def main() -> None:
         action="store_true",
         help="使用评测 CSV 的全量 MATCH 数据（不再按 80/10/10 仅取最后 10%）",
     )
+    parser.add_argument(
+        "--concurrency", type=int, default=1,
+        help="并行请求数（默认 1 串行；建议不超过 vLLM 的 max-num-seqs，如 4~6）",
+    )
+    parser.add_argument(
+        "--enable-thinking", action="store_true", default=None,
+        help="强制开启思考模式（覆盖 BASELINE_ENABLE_THINKING 环境变量）",
+    )
+    parser.add_argument(
+        "--no-thinking", action="store_true",
+        help="强制关闭思考模式（覆盖 BASELINE_ENABLE_THINKING 环境变量）",
+    )
     args = parser.parse_args()
 
-    # 最小改动：复用 training.evaluate.run_evaluation，
-    # 仅在入口处把其读取的数据文件切到用户指定 CSV。
+    # 命令行覆盖 settings 中的思考开关
+    if args.enable_thinking:
+        settings.baseline_enable_thinking = True
+    elif args.no_thinking:
+        settings.baseline_enable_thinking = False
+
     settings.train_csv = Path(args.eval_csv)
     if args.use_full_data:
-        # run_evaluation 会按 train_split + val_split 计算测试集起点；
-        # 设为 0 即可使用全量 MATCH 数据作为评测集。
         settings.train_split = 0.0
         settings.val_split = 0.0
 
@@ -71,6 +85,7 @@ async def main() -> None:
         output_path=out_path,
         label=f"baseline_{args.mode}",
         full_output_path=full_out_path,
+        concurrency=args.concurrency,
     )
 
 

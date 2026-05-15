@@ -21,6 +21,7 @@ from difflib import SequenceMatcher
 
 sys.path.insert(0, str(os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))))
 from config.settings import settings
+from training.template_split import split_dataframe_by_template
 
 # 输出路径
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -211,15 +212,12 @@ def main():
         encoding="utf-8",
     )
     df_full = df_full[df_full["SQL验证状态"] == "MATCH"].copy()
-    df_full = df_full.sample(frac=1, random_state=settings.random_state).reset_index(drop=True)
-
-    n = len(df_full)
-    train_end = int(n * settings.train_split)
-    val_end = int(n * (settings.train_split + settings.val_split))
-
-    df_train = df_full.iloc[:train_end]
-    df_val = df_full.iloc[train_end:val_end]
-    df_test = df_full.iloc[val_end:]
+    df_train, df_val, df_test = split_dataframe_by_template(
+        df_full,
+        template_col="问题模版",
+        train_split=settings.train_split,
+        val_split=settings.val_split,
+    )
 
     print(f"训练集: {len(df_train)} | 验证集: {len(df_val)} | 测试集: {len(df_test)}")
 
