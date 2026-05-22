@@ -6,36 +6,44 @@ CrossEncoder 验证/测试评估脚本。
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 
-import numpy as np
-import pandas as pd
-from sentence_transformers import CrossEncoder
-
 sys.path.insert(0, str(os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))))
 from config.settings import settings
+from training.dataset_io import read_jsonl
 
-VAL_FILE = os.path.join(os.path.dirname(__file__), "cross_encoder_val_data.json")
-TEST_FILE = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.json")
-TOP_K = 6
+VAL_FILE_JSONL = os.path.join(os.path.dirname(__file__), "cross_encoder_val_data.jsonl")
+TEST_FILE_JSONL = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.jsonl")
+VAL_FILE_JSON = os.path.join(os.path.dirname(__file__), "cross_encoder_val_data.json")
+TEST_FILE_JSON = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.json")
+TOP_K = 6  # 与 figure/crossencoder/paths.VAL_TOP_K 一致
 
 
 def get_eval_file(split: str) -> str:
+    """优先返回 JSONL 路径；若不存在则回退到旧 JSON 路径，方便迁移期共存。"""
     split_norm = split.strip().lower()
     if split_norm == "val":
-        return VAL_FILE
+        return VAL_FILE_JSONL if os.path.isfile(VAL_FILE_JSONL) else VAL_FILE_JSON
     if split_norm == "test":
-        return TEST_FILE
+        return TEST_FILE_JSONL if os.path.isfile(TEST_FILE_JSONL) else TEST_FILE_JSON
     raise ValueError(f"不支持的数据集类型: {split}，仅支持 val/test")
 
 
-def evaluate(split: str = "val", top_k: int = TOP_K) -> None:
-    eval_file = get_eval_file(split)
-    model_path = str(settings.cross_encoder_model)
-    # model_path = str(settings.reranker_base_model)
+def _load_eval_records(path: str) -> list[dict]:
+    if path.endswith(".jsonl"):
+        return list(read_jsonl(path))
+    import json as _json
 
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return _json.load(f)
+
+
+def evaluate(split: str = "val", top_k: int = TOP_K) -> None:
+    from training.cross_encoder_eval import evaluate_cross_encoder as _eval_metrics
+
+    model_path = str(settings.cross_encoder_model)
+    eval_file = get_eval_file(split)
 
     print(f"开始评估 CrossEncoder ({split})...")
     print(f"模型路径: {model_path}")
@@ -49,61 +57,17 @@ def evaluate(split: str = "val", top_k: int = TOP_K) -> None:
         print(f"[ERROR] 评估数据文件不存在: {eval_file}，请先运行 prepare_data.py")
         return
 
-    csv_path = str(settings.csv_path)
-    if not os.path.isfile(csv_path):
-        print(f"[ERROR] CSV 数据文件不存在: {csv_path}")
+    try:
+        metrics = _eval_metrics(model_path, split=split, top_k=top_k)
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
         return
 
-    model = CrossEncoder(model_path, trust_remote_code=True)
-
-
-    # 候选列：来自业务表 CSV 表头
-    df_raw = pd.read_csv(csv_path, nrows=1)
-    all_cols = [str(c).strip() for c in df_raw.columns]
-    print(f"候选列数: {len(all_cols)}")
-
-    with open(eval_file, "r", encoding="utf-8") as f:
-        eval_data = json.load(f)
-
-    success = 0
-    total = 0
-    top1_hits = 0
-
-    for i, item in enumerate(eval_data):
-        question = str(item.get("question", "")).strip()
-        gold = set(item.get("gold_columns", []))
-        if not question or not gold:
-            continue
-
-        inputs = [[question, col] for col in all_cols]
-        scores = model.predict(inputs, batch_size=32)
-        sorted_idx = np.argsort(scores)[::-1]
-        topk_idx = sorted_idx[:top_k]
-        pred_topk = [all_cols[j] for j in topk_idx]
-        pred_topk_set = set(pred_topk)
-
-        is_full_recall = gold.issubset(pred_topk_set)
-        if is_full_recall:
-            success += 1
-
-        if pred_topk and pred_topk[0] in gold:
-            top1_hits += 1
-
-        total += 1
-
-        if i < 3:
-            print(f"\n[Case {i}] Q: {question}")
-            print(f"  Gold: {sorted(gold)}")
-            print(f"  Top-1: {pred_topk[0] if pred_topk else 'N/A'}")
-            print(f"  Top-{top_k} (前5): {pred_topk[:5]}")
-            print(f"  {'OK' if is_full_recall else 'FAIL'}")
-
-    full_recall = success / total if total else 0.0
-    top1_acc = top1_hits / total if total else 0.0
-
     print(f"\n{'=' * 50}")
-    print(f"{split.upper()} Top-{top_k} Full Recall: {full_recall:.2%} ({success}/{total})")
-    print(f"{split.upper()} Top-1 Hit Rate: {top1_acc:.2%} ({top1_hits}/{total})")
+    print(
+        f"{split.upper()} Top-{top_k} Recall@K: "
+        f"{metrics['recall_at_k']:.2%} ({metrics['success']}/{metrics['total']})"
+    )
 
 
 if __name__ == "__main__":

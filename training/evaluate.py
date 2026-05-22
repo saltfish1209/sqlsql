@@ -148,22 +148,45 @@ def normalize_execution_result(result):
     return _normalize_single_result(result)
 
 
-def _compare_results(gt, pred) -> bool:
+def _name_only_set(s: set[str]) -> set[str]:
+    """把 '名称|数值' 行降级为仅名称集合；无'|'时保留整项。"""
+    out: set[str] = set()
+    for item in s:
+        text = str(item).strip()
+        if not text:
+            continue
+        out.add(text.split("|", 1)[0].strip())
+    return out
+
+
+def _compare_results(gt, pred) -> tuple[bool, float, str]:
     """
-    GT vs 预测的统一比较：
-      - 都是 list[set] → 元素个数与每个子集合都必须相等
-      - 都是 set      → 集合相等
-      - 形态不一致     → False（避免单结果模型瞎对上多结果 GT）
+    返回 (is_correct, score, match_type)
+      - full match: 1.0
+      - name-only match: 0.7（仅针对单结果 set 形态）
+      - mismatch: 0.0
     """
     gt_is_list = isinstance(gt, list)
     pred_is_list = isinstance(pred, list)
     if gt_is_list != pred_is_list:
-        return False
+        return False, 0.0, "shape_mismatch"
+
     if gt_is_list:
         if len(gt) != len(pred):
-            return False
-        return all(g == p for g, p in zip(gt, pred))
-    return gt == pred
+            return False, 0.0, "multi_len_mismatch"
+
+        gt_bag = Counter(tuple(sorted(s)) for s in gt)
+        pred_bag = Counter(tuple(sorted(s)) for s in pred)
+        ok = gt_bag == pred_bag
+        return ok, (1.0 if ok else 0.0), ("full" if ok else "mismatch")
+
+    if gt == pred:
+        return True, 1.0, "full"
+
+    if gt and pred and _name_only_set(gt) == _name_only_set(pred):
+        return False, 0.7, "name_only"
+
+    return False, 0.0, "mismatch"
 
 
 def _flatten_result_values(parsed) -> set[str]:
@@ -310,11 +333,11 @@ async def run_evaluation(
                 entities = output.get("entities") or []
                 pred_sql = output.get("final_sql") or ""
                 reason = str(output.get("reason") or "")
-                ok = _compare_results(gt_parsed, pred_parsed)
-                icon = "OK" if ok else "FAIL"
+                ok, score, match_type = _compare_results(gt_parsed, pred_parsed)
+                icon = "OK" if ok else ("PARTIAL" if score > 0 else "FAIL")
                 error_type = ""
                 error_detail = ""
-                if not ok:
+                if not ok and score == 0.0:
                     error_type, error_detail = classify_error_type(
                         gt_parsed, pred_parsed, reason=reason
                     )
@@ -324,7 +347,10 @@ async def run_evaluation(
                       f"total={total_cost:.2f}s first_infer={first_infer:.2f}s "
                       f"repairs={repair_times}")
                 if not ok:
-                    print(f"  错误类型   : {error_type} ({error_detail})")
+                    if score > 0:
+                        print(f"  匹配类型   : {match_type} (score={score:.2f})")
+                    else:
+                        print(f"  错误类型   : {error_type} ({error_detail})")
                 print(f"  问题      : {question}")
                 print(f"  实体/关键词: {entities}")
                 print(f"  正确结果   : {_stringify_for_log(gt_parsed)}")
@@ -344,6 +370,8 @@ async def run_evaluation(
                         "pred_parsed": _stringify_for_log(pred_parsed),
                         "is_multi": isinstance(gt_parsed, list),
                         "is_correct": ok,
+                        "score": score,
+                        "match_type": match_type,
                         "error_type": error_type,
                         "error_detail": error_detail,
                         "reason": reason,
@@ -352,6 +380,7 @@ async def run_evaluation(
                     "total_cost": total_cost,
                     "repair_times": repair_times,
                     "is_correct": ok,
+                    "score": score,
                 }
             except Exception as e:
                 dt = time.time() - t0

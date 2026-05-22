@@ -3,7 +3,6 @@ CrossEncoder Top-K 全覆盖率评估 —— 验证 Schema Pruner 的召回能�
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 
@@ -13,9 +12,27 @@ from sentence_transformers import CrossEncoder
 
 sys.path.insert(0, str(os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))))
 from config.settings import settings
+from pipeline.cross_encoder_passage import build_column_passage_map
+from training.dataset_io import read_jsonl
 
-TEST_FILE = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.json")
+TEST_FILE_JSONL = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.jsonl")
+TEST_FILE_JSON = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.json")
 TOP_K = 15
+
+
+def _load_eval_records(jsonl_path: str, json_path: str) -> list[dict] | None:
+    if os.path.isfile(jsonl_path):
+        return list(read_jsonl(jsonl_path))
+    if os.path.isfile(json_path):
+        import json as _json
+
+        with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
+            try:
+                return _json.load(f)
+            except _json.JSONDecodeError as exc:
+                print(f"[ERROR] 评估文件解析失败 ({exc.msg}): {json_path}")
+                return None
+    return None
 
 
 def evaluate():
@@ -31,14 +48,18 @@ def evaluate():
         print(f"[ERROR] CSV 数据文件不存在: {csv_path}")
         return
     df_raw = pd.read_csv(csv_path, nrows=1)
-    all_cols = [str(c).strip() for c in df_raw.columns]
+    raw_cols = [str(c).strip() for c in df_raw.columns]
+    passage_map = build_column_passage_map(str(settings.schema_path), csv_path, active_columns=raw_cols)
+    all_cols = list(passage_map.keys())
     print(f"候选列数: {len(all_cols)}")
 
-    if not os.path.isfile(TEST_FILE):
-        print(f"[ERROR] 测试数据文件不存在: {TEST_FILE}，请先运行 prepare_data.py")
+    test_data = _load_eval_records(TEST_FILE_JSONL, TEST_FILE_JSON)
+    if test_data is None:
+        print(
+            f"[ERROR] 测试数据不存在: {TEST_FILE_JSONL} 或 {TEST_FILE_JSON}，"
+            "请先运行 prepare_data.py"
+        )
         return
-    with open(TEST_FILE, "r", encoding="utf-8") as f:
-        test_data = json.load(f)
 
     success = total = 0
     for i, item in enumerate(test_data):
@@ -46,7 +67,7 @@ def evaluate():
         gold = set(item["gold_columns"])
         if not gold:
             continue
-        inputs = [[question, col] for col in all_cols]
+        inputs = [[question, passage_map[col]] for col in all_cols]
         scores = model.predict(inputs, batch_size=32)
         top_idx = np.argsort(scores)[::-1][:TOP_K]
         pred = set(all_cols[j] for j in top_idx)

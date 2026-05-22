@@ -9,8 +9,10 @@ import numpy as np
 import math
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 from data_computation import EnhanceDataQueryBuilder
 from sql_generator import SQLQueryBuilder
+from training.dataset_io import normalize_cell_text
 from multi_result_utils import (
     MULTI_RESULT_SEP,
     split_answer_template_top_level,
@@ -202,7 +204,8 @@ def extract_and_compute(row: pd.Series, template_row: pd.DataFrame, df_raw: pd.D
                 "multi_conditions": multi_conditions,
                 "results": ranked_results,  # List[Dict]
                 "aggregation": None,  # 走非聚合拼接路径
-                "is_one_to_one": len(ranked_results) == 1
+                "is_one_to_one": len(ranked_results) == 1,
+                "rank_return_cols": params.get('return_cols') or [],
             }
 
             # 准备sql参数
@@ -256,8 +259,11 @@ def extract_and_compute(row: pd.Series, template_row: pd.DataFrame, df_raw: pd.D
     # -----------------------------
     else:
         if not matched_df.empty and a_fields:
-            simplified = matched_df[a_fields].drop_duplicates()
-            results = [{f: str(r[f]).strip() for f in a_fields} for _, r in simplified.iterrows()]
+            normalized = matched_df[a_fields].copy()
+            for field in a_fields:
+                normalized[field] = normalized[field].map(normalize_cell_text)
+            simplified = normalized.drop_duplicates()
+            results = [{f: normalize_cell_text(r[f]) for f in a_fields} for _, r in simplified.iterrows()]
         else:
             results = []
 
@@ -299,10 +305,15 @@ def extract_and_compute(row: pd.Series, template_row: pd.DataFrame, df_raw: pd.D
         else:
             # 列表结果 (select, listdown)
             # 遍历所有结果行，如果是多列组合，拼接成字符串 "值1|值2"
+            rank_cols = py_final_data.get('rank_return_cols') or []
             for row in py_final_data['results']:
-                vals = [str(v).strip() for v in row.values()]
+                if rank_cols:
+                    vals = [str(row.get(col, "")).strip() for col in rank_cols]
+                else:
+                    vals = [str(v).strip() for v in row.values()]
                 # 再次过滤空值（双重保险）
-                if any(v == '' for v in vals): continue
+                if any(v == '' for v in vals):
+                    continue
                 py_set.add("|".join(vals))
             py_val_repr = f"Set(len={len(py_set)}) {list(py_set)[:3]}..."
 
@@ -316,13 +327,22 @@ def extract_and_compute(row: pd.Series, template_row: pd.DataFrame, df_raw: pd.D
                 sql_val_repr = "None"
         else:
             # 列表结果
+            rank_cols = py_final_data.get('rank_return_cols') or []
             for row in sql_rows:
                 # row 是 tuple ('val1', 'val2')
                 # 过滤掉 SQL 返回的空值行 (重要！配合 sql_generator 的修改)
                 if not row or all((v is None or str(v).strip() == '') for v in row):
                     continue
 
-                clean_row = [str(v).strip() for v in row]
+                # 对 listdown/listup，SQL 会额外返回排序依据列 _val，
+                # 但答案只需要 return_cols，对齐后再比较集合。
+                if rank_cols:
+                    row_core = row[:len(rank_cols)]
+                else:
+                    row_core = row
+                clean_row = [str(v).strip() for v in row_core]
+                if any(v == '' for v in clean_row):
+                    continue
                 sql_set.add("|".join(clean_row))
             sql_val_repr = f"Set(len={len(sql_set)}) {list(sql_set)[:3]}..."
 
@@ -413,9 +433,17 @@ def _format_sub_answer(sub_result: dict) -> str:
         if not rows_data:
             return ""
         return str(rows_data[0].get('value', ''))
+    rank_cols = sub_result.get('rank_return_cols') or []
     cells = []
     for row_dict in rows_data:
-        cells.append("|".join([str(v) for v in row_dict.values()]))
+        if rank_cols:
+            vals = [str(row_dict.get(col, "")).strip() for col in rank_cols]
+        else:
+            vals = [str(v).strip() for k, v in row_dict.items() if k != "_generated_metric"]
+        vals = [v for v in vals if v != ""]
+        if not vals:
+            continue
+        cells.append("|".join(vals))
     return "，".join(cells)
 
 
@@ -577,10 +605,18 @@ def get_multiple_filled_qa_pairs(template_row: pd.DataFrame, df_raw: pd.DataFram
             elif result['aggregation']:
                 answer = str(result['results'][0]['value'])
             else:
+                rank_cols = result.get('rank_return_cols') or []
                 all_rows = []
                 for row_dict in result['results']:
-                    # 将这一行的所有列的值拼接（例如：'物资A 100个'）
-                    row_str = "|".join([str(v) for v in row_dict.values()])
+                    # 排序类答案只保留排序结果本身，不附带排序依据值（如 sum/count）。
+                    if rank_cols:
+                        vals = [str(row_dict.get(col, "")).strip() for col in rank_cols]
+                    else:
+                        vals = [str(v).strip() for k, v in row_dict.items() if k != "_generated_metric"]
+                    vals = [v for v in vals if v != ""]
+                    if not vals:
+                        continue
+                    row_str = "|".join(vals)
                     all_rows.append(row_str)
 
                 # 将多行数据用中文逗号或分号连接

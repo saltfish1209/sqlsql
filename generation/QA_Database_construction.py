@@ -9,7 +9,9 @@ import re
 from openai import OpenAI
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 from construct import get_multiple_filled_qa_pairs
+from training.dataset_io import normalize_and_deduplicate_dataframe, normalize_cell_text
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
@@ -109,12 +111,13 @@ def generate_batch_similar_questions(qa_pairs: list, q_template:str,a_template:s
    - 必须参考 [数据库实体] 中的值。
    - **模拟用户输入**：针对原始问题，采用不同角度、想法等但**不能偏离问题原本含义**的方法重新提问。
    - **保留关键特征**：模糊化不能导致歧义（例如不能把 "A型" 改成 "B型"）。
-   -**语义模糊**对所提到的关键词，可以进行歧义改写，但不能脱离[答案模版]、因为答案模版表示答案所在列和答案计算方式
+   -**语义模糊**对问题中所提到的查询关键词，可以轻微缩写但不可以进行大部分歧义改写。
+   -**语义模糊**对所提到的目标，可以进行轻微歧义改写，但不能脱离[答案模版]、因为答案模版表示答案所在列或者答案计算方式
 3. **句式多样性**：
    - 打破原始问题的语法结构。
    -自由编排内容，答案和查询逻辑不要脱离[标准答案]
    - 使用口语（"这个物料的编码是多少？"）。
-4. **格式严格**：只输出 {num} 行，不要包含任何序号或多余解释。
+4. **格式严格**：只输出 {num} 行，不要包含任何序号或多余解释。问题不要使用任何时间描述，数据集中不存在时间列。禁止生成的小问题数量大于原始问题的数量。
    每行格式：生成的问题|||答案:对应的回答
 
 -**[问题模版]**:{q_template}
@@ -193,10 +196,14 @@ def main():
         (df_template[COL_A_TEMPLATE].astype(str).str.strip() != '')
         ]
     print(f"过滤空模板后数量: {len(df_template)}")
+    df_template, removed_templates = normalize_and_deduplicate_dataframe(
+        df_template,
+        subset=[COL_Q_TEMPLATE, COL_A_TEMPLATE],
+    )
+    print(f"模板去重后数量: {len(df_template)} (删除 {removed_templates} 条重复模板)")
 
     df_raw = pd.read_csv(INPUT_DATA_FILE, dtype=str)
-    df_clean = df_raw.map(clean_value)
-    df_clean.columns = [c.strip() for c in df_clean.columns]
+    df_clean = normalize_and_deduplicate_dataframe(df_raw.map(clean_value))[0]
 
     print(f"🔄 正在转换数字列类型...")
     for col in NUMERIC_COLS:
@@ -232,10 +239,10 @@ def main():
 
     if MODE == 'resume' and file_exists:
         try:
-            existing_df = pd.read_csv(OUTPUT_FILE)
+            existing_df = normalize_and_deduplicate_dataframe(pd.read_csv(OUTPUT_FILE, dtype=str))[0]
             # 获取已经存在的“问题模版”列表
             if '问题模版' in existing_df.columns:
-                existing_counts = Counter(existing_df['问题模版'])
+                existing_counts = Counter(existing_df['问题模版'].map(normalize_cell_text))
             print(f"📂 已读取现有进度，将补齐未满 {TARGET_SAMPLES} 条的任务。")
 
             # 如果是追加模式，先加载旧数据到内存（如果不嫌大）或者直接以 append 模式写入
@@ -264,8 +271,8 @@ def main():
 
     # --- 2. 主循环 ---
     for idx, template_row in df_template.iterrows():
-        q_temp = template_row.get(COL_Q_TEMPLATE, '')
-        a_template = template_row.get(COL_A_TEMPLATE, '')
+        q_temp = normalize_cell_text(template_row.get(COL_Q_TEMPLATE, ''))
+        a_template = normalize_cell_text(template_row.get(COL_A_TEMPLATE, ''))
 
         if not q_temp or pd.isna(q_temp):
             continue

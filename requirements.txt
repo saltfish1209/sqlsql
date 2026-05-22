@@ -4,6 +4,7 @@ pandas>=2.0
 sentence-transformers>=3.0
 datasketch>=1.6
 torch>=2.0
+faiss-cpu>=1.8
 einops>=0.7
 
 # 训练 (可选)

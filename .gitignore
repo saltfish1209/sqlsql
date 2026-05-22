@@ -7,9 +7,16 @@
 /.cursorrules
 /.claude
 /.cursor
+/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+/pipeline/similarity_cache/
 /superpowers-main
 *.json
 *.jsonl
 *.csv
+!/figure/crossencoder/results/.gitkeep
+/figure/crossencoder/checkpoints/
 
 

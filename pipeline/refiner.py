@@ -20,12 +20,12 @@ class SQLRefiner:
 
     async def refine_async(
         self,
-        question: str,
         schema_prompt: str,
         candidates: list[dict],
-        valid_columns: list[str],
+        top20_candidates: list[dict] | list[str],
         tracker: TokenTracker,
         max_retries: int | None = None,
+        plan_json: dict | None = None,
     ) -> list[dict]:
         refined = []
         for cand in candidates:
@@ -42,12 +42,12 @@ class SQLRefiner:
                 repaired.setdefault("result", None)
                 repaired["status"] = "needs_repair"
                 repaired = await self._attempt_llm_repair(
-                    question=question,
                     schema_prompt=schema_prompt,
                     candidate=repaired,
-                    valid_columns=valid_columns,
+                    valid_columns=top20_candidates,
                     tracker=tracker,
                     max_retries=max_retries or settings.max_repair_retries,
+                    plan_json=plan_json or {},
                 )
                 refined.append(repaired)
             else:
@@ -65,21 +65,19 @@ class SQLRefiner:
 
     async def _attempt_llm_repair(
         self,
-        question: str,
         schema_prompt: str,
         candidate: dict,
         valid_columns: list[dict] | list[str],
         tracker: TokenTracker,
         max_retries: int,
+        plan_json: dict,
     ) -> dict:
         sql = candidate.get("sql") or ""
-        prompt_schema = self._format_schema_prompt(schema_prompt, valid_columns)
         prompt = (
-            "你是SQL修复专家。请根据错误SQL、错误原因和精简schema重新生成正确SQL。\n"
-            f"[问题]\n{question}\n"
+            "你是SQL修复专家。请根据错误SQL、错误原因和plan_json重新生成正确SQL。\n"
             f"[错误SQL]\n{sql}\n"
             f"[错误原因]\n{candidate.get('error_msg', '')}\n"
-            f"[精简schema]\n{prompt_schema}\n"
+            f"[plan_json]\n{json.dumps(plan_json or {}, ensure_ascii=False, indent=2)}\n"
             "要求：只输出可执行SQL，用```sql包裹。"
         )
         try:
@@ -108,10 +106,18 @@ class SQLRefiner:
             return candidate
 
     @staticmethod
-    def _format_schema_prompt(schema_prompt: str, valid_columns: list[dict] | list[str]) -> str:
-        if valid_columns and isinstance(valid_columns[0], dict):
+    def _build_relaxed_recall_schema(recall_schema: list[dict]) -> list[dict]:
+        if not recall_schema:
+            return []
+        best = max(float(x.get("相关性分数") or 0.0) for x in recall_schema)
+        threshold = best * float(getattr(settings, "candidate_cliff_min_ratio", 0.15))
+        return [x for x in recall_schema if float(x.get("相关性分数") or 0.0) >= threshold]
+
+    @staticmethod
+    def _format_schema_prompt(schema_prompt: str, top20_candidates: list[dict] | list[str]) -> str:
+        if top20_candidates and isinstance(top20_candidates[0], dict):
             lines = []
-            for col in valid_columns:
+            for col in top20_candidates:
                 lines.append(
                     f'- 列名：{col.get("列名", "")} | 相关性分数：{col.get("相关性分数", "")} | 列描述：{col.get("列描述", "")} | 字段类型：{col.get("字段类型", "")} | 是否枚举：{col.get("是否枚举", "")}'
                 )

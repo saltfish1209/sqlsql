@@ -58,7 +58,7 @@ class ColumnProfile:
         """生成自然语言摘要（含列名），供独立 profile 预览脚本使用。"""
         parts = [f"「{self.name}」"]
         parts.append(f"类型={self.dtype_inferred}")
-        if self.null_ratio > 0.3:
+        if self.null_ratio > 0:
             parts.append(f"空值率={self.null_ratio:.0%}")
         parts.append(f"唯一值={self.distinct_count}")
         if self.is_categorical and self.top_values:
@@ -81,17 +81,17 @@ class ColumnProfile:
         """
         parts: list[str] = []
         parts.append(f"字段类型={self.dtype_inferred}")
-        if self.null_ratio > 0.3:
+        if self.null_ratio > 0:
             parts.append(f"空值率={self.null_ratio:.0%}")
         full_threshold = settings.profile_enum_full_threshold
-        if self.distinct_count <= full_threshold and self.top_values:
+        if self.distinct_count <= 20 and self.top_values:
             all_vals = [v for v, _ in self.top_values[: self.distinct_count]]
-            if 1 < self.distinct_count:
+            if 1 < self.distinct_count <= full_threshold:
                 parts.append(f"枚举值={'/'.join(all_vals)}")
             elif self.sample_values:
-                parts.append(f"示例={'/'.join(self.sample_values)}")
+                parts.append(f"示例={'/'.join(self.sample_values[:3])}")
         elif self.sample_values:
-            parts.append(f"示例={'/'.join(self.sample_values)}")
+            parts.append(f"示例={'/'.join(self.sample_values[:3])}")
         if self.dtype_inferred == "NUMERIC" and self.min_val is not None and self.max_val is not None:
             parts.append(f"范围=[{self.min_val},{self.max_val}]")
         if self.format_pattern:
@@ -156,10 +156,24 @@ class DatabaseProfiler:
             profiles = self.profile_all()
         detail: dict[str, dict] = {}
         for p in profiles:
-            detail[p.name] = {
+            enum_values = [v for v, _ in p.top_values] if p.distinct_count <= settings.profile_enum_full_threshold else []
+            row: dict[str, Any] = {
                 "字段类型": p.dtype_inferred,
-                "枚举值": [v for v, _ in p.top_values] if p.distinct_count <= settings.profile_enum_full_threshold else [],
             }
+            if p.distinct_count <= 20:
+                row["唯一值数"] = p.distinct_count
+            if p.format_pattern:
+                row["格式"] = p.format_pattern
+            if enum_values:
+                row["枚举值"] = enum_values
+                row["是否枚举"] = "是"
+            if p.null_ratio > 0:
+                row["空值率"] = f"{p.null_ratio:.2%}" if p.total else "0.00%"
+            if p.distinct_count <= 20 and p.sample_values:
+                row["示例值"] = p.sample_values[:3]
+            if p.dtype_inferred == "NUMERIC" and p.min_val is not None and p.max_val is not None:
+                row["范围"] = f"[{p.min_val},{p.max_val}]"
+            detail[p.name] = row
         return detail
 
     def _profile_column(self, col: str) -> ColumnProfile:

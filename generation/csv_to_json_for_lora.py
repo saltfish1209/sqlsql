@@ -10,6 +10,7 @@ DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
 
 sys.path.insert(0, os.path.normpath(os.path.join(BASE_DIR, "..")))
 from config.settings import settings
+from training.dataset_io import normalize_and_deduplicate_dataframe
 from training.template_split import split_dataframe_by_template
 
 INPUT_CSV = os.path.join(DATA_DIR, "train_dataset_with_sql_and_slots.csv")
@@ -173,7 +174,9 @@ def save_jsonl(data, output_path):
 
 # ---------------- 主程序 ----------------
 def main():
-    df = pd.read_csv(INPUT_CSV, dtype=str)
+    df_raw = pd.read_csv(INPUT_CSV, dtype=str)
+    df, dedup_removed = normalize_and_deduplicate_dataframe(df_raw)
+    print(f"归一化去重: {len(df_raw)} -> {len(df)} (删除 {dedup_removed} 条)")
 
     full_schema_meta = load_schema_meta(INPUT_SCHEMA_FILE)
 

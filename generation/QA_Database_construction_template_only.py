@@ -9,19 +9,24 @@
 from __future__ import annotations
 
 from collections import Counter
+import csv
 import json
 import os
 import sqlite3
 
 import pandas as pd
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+import sys
+sys.path.insert(0, os.path.normpath(os.path.join(BASE_DIR, "..")))
+
 from construct import get_multiple_filled_qa_pairs
+from training.dataset_io import normalize_and_deduplicate_dataframe, normalize_cell_text
 
 
 # 运行模式：resume / overwrite
 MODE = "overwrite"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
 
 INPUT_TEMPLATE_FILE = os.path.join(DATA_DIR, "副本问题收集模板.CSV")
@@ -81,10 +86,19 @@ def clean_value(x):
     return s
 
 
+CSV_WRITE_KWARGS = dict(
+    encoding="utf-8-sig",
+    quoting=csv.QUOTE_ALL,
+    escapechar="\\",
+    doublequote=True,
+    lineterminator="\n",
+)
+
+
 def init_output_file_if_needed(file_exists: bool):
     if (not file_exists) or MODE == "overwrite":
         pd.DataFrame(columns=CSV_COLUMNS).to_csv(
-            OUTPUT_FILE, index=False, encoding="utf-8-sig"
+            OUTPUT_FILE, index=False, **CSV_WRITE_KWARGS
         )
 
 
@@ -111,10 +125,16 @@ def main():
     ]
     print(f"过滤空模板后数量: {len(df_template)}")
 
+    # 去重：生成拓展问答前按(提问模版, 回答模版)删除重复模板
+    df_template, removed_templates = normalize_and_deduplicate_dataframe(
+        df_template,
+        subset=[COL_Q_TEMPLATE, COL_A_TEMPLATE],
+    )
+    print(f"模板去重后数量: {len(df_template)} (删除 {removed_templates} 条重复模板)")
+
     # 原始数据清洗
     df_raw = pd.read_csv(INPUT_DATA_FILE, dtype=str)
-    df_clean = df_raw.map(clean_value)
-    df_clean.columns = [str(c).strip() for c in df_clean.columns]
+    df_clean = normalize_and_deduplicate_dataframe(df_raw.map(clean_value))[0]
 
     print("🔄 转换数值列类型...")
     for col in NUMERIC_COLS:
@@ -134,9 +154,9 @@ def main():
     file_exists = os.path.exists(OUTPUT_FILE)
     if MODE == "resume" and file_exists:
         try:
-            existing_df = pd.read_csv(OUTPUT_FILE)
+            existing_df = normalize_and_deduplicate_dataframe(pd.read_csv(OUTPUT_FILE, dtype=str))[0]
             if "问题模版" in existing_df.columns:
-                existing_counts = Counter(existing_df["问题模版"])
+                existing_counts = Counter(existing_df["问题模版"].map(normalize_cell_text))
             print(f"📂 已读取现有进度，将补齐未满 {TARGET_SAMPLES} 条的模板。")
         except Exception as e:
             print(f"⚠️ 读取现有输出失败，将从头开始：{e}")
@@ -153,8 +173,8 @@ def main():
     }
 
     for idx, template_row in df_template.iterrows():
-        q_temp = template_row.get(COL_Q_TEMPLATE, "")
-        a_temp = template_row.get(COL_A_TEMPLATE, "")
+        q_temp = normalize_cell_text(template_row.get(COL_Q_TEMPLATE, ""))
+        a_temp = normalize_cell_text(template_row.get(COL_A_TEMPLATE, ""))
         if not q_temp or pd.isna(q_temp):
             continue
 
@@ -216,12 +236,16 @@ def main():
 
             batch_data = []
             for pair in valid_qa_list:
+                gen_q = str(pair.get("filled_question", "") or "").strip()
+                if not gen_q:
+                    continue
+
                 row_data = {
                     "问题模版": q_temp,
                     "回答模版": a_temp,
-                    "原始填充问题": pair.get("filled_question", ""),
+                    "原始填充问题": gen_q,
                     # 纯填充模式：生成问题直接用填充问题，不做 LLM 改写
-                    "生成问题": pair.get("filled_question", ""),
+                    "生成问题": gen_q,
                     "生成结果": pair.get("answer", ""),
                     "标准答案": pair.get("answer", ""),
                     "SQL语句": pair.get("sql", ""),
@@ -242,7 +266,7 @@ def main():
                     mode="a",
                     header=False,
                     index=False,
-                    encoding="utf-8-sig",
+                    **CSV_WRITE_KWARGS,
                 )
                 stats["saved_rows"] += len(batch_data)
                 stats["success"] += 1

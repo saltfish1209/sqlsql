@@ -52,6 +52,7 @@ class Settings:
     qa_template_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_template_only.csv")
     train_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_with_sql_and_slots.csv")
     table_name: str = "procurement_table"
+    fewshot_index_dir: Path = field(default_factory=lambda: CACHE_DIR / "fewshot_index")
 
     # ── 本地模型路径 ──
     embed_model: str = field(
@@ -74,18 +75,30 @@ class Settings:
     )
 
     # ── Retrieval-first schema linking ──
-    candidate_top_k: int = 20
     candidate_value_top_k: int = 3
-    candidate_exact_bonus: float = 0.35
-    candidate_semantic_bonus: float = 0.25
-    candidate_fuzzy_bonus: float = 0.15
-    candidate_min_score: float = 0.18
-    candidate_max_columns: int = 18
+    # candidate_exact_bonus: float = 0.35
+    # candidate_semantic_bonus: float = 0.25
+    # candidate_fuzzy_bonus: float = 0.05
+    # candidate_min_score: float = 0.18
+    # candidate_max_columns: int = 18
+    # 断崖法与比例截取参数（支持环境变量覆盖）
+    candidate_cliff_decay_threshold: float = field(
+        default_factory=lambda: float(os.getenv("CANDIDATE_CLIFF_DECAY_THRESHOLD", "0.6"))
+    )
+    candidate_cliff_protect_ratio: float = field(
+        default_factory=lambda: float(os.getenv("CANDIDATE_CLIFF_PROTECT_RATIO", "0.3"))
+    )
+    candidate_cliff_min_ratio: float = field(
+        default_factory=lambda: float(os.getenv("CANDIDATE_CLIFF_MIN_RATIO", "0.05"))
+    )
+    candidate_top_k: int = field(
+        default_factory=lambda: int(os.getenv("CANDIDATE_TOP_K", "20"))
+    )
     lsh_threshold: float = 0.62
     lsh_num_perm: int = 64
     lsh_query_jaccard_threshold: float = 0.78
     lsh_query_seq_ratio: float = 0.84
-    lsh_query_combined_threshold: float = 0.78
+    lsh_query_combined_threshold: float = 0.72
     c_secondary_seq_ratio: float = 0.82
     c_secondary_jaccard: float = 0.55
     c_secondary_seq_with_jac: float = 0.62
@@ -102,6 +115,8 @@ class Settings:
     )
     top_k_embed: int = 10
     index_cache_dir: Path = field(default_factory=lambda: CACHE_DIR / "value_indexes")
+    # few-shot 索引与其他索引库同路径（统一挂在 value_indexes 下）
+    fewshot_index_dir: Path = field(default_factory=lambda: CACHE_DIR / "value_indexes" / "fewshot_index")
 
     # 轻量检索后，交给 LLM 做证据实体与字段分类时的上下文上限
     evidence_schema_top_k: int = 10
@@ -121,6 +136,9 @@ class Settings:
     num_sql_per_path: int = 1
     icl_few_shot_k: int = field(
         default_factory=lambda: int(os.getenv("ICL_FEW_SHOT_K", "3"))
+    )
+    fewshot_autobuild_on_start: bool = field(
+        default_factory=lambda: os.getenv("FEWSHOT_AUTOBUILD_ON_START", "True").lower() == "true"
     )
     icl_temperature: float = 0.1
     direct_temperature: float = 0.3
@@ -168,6 +186,9 @@ class Settings:
     profile_sample_rows: int = 100
     profile_distinct_threshold: int = 80
     profile_enum_full_threshold: int = 15
+    deprecated_column_null_ratio_threshold: float = field(
+        default_factory=lambda: float(os.getenv("DEPRECATED_COLUMN_NULL_RATIO_THRESHOLD", "0.95"))
+    )
 
     # ── Flow control ──
     enable_question_split: bool = field(
@@ -180,19 +201,15 @@ class Settings:
     )
 
     # ── 训练 ──
-    train_split: float = 0.8
-    val_split: float = 0.0
-    test_split: float = 0.2
-    random_state: int = 42
-    # ── 调试 ──
-    debug_mode: bool = field(
-        default_factory=lambda: os.getenv("DEBUG_MODE", "True").lower() == "true"
+    train_split: float = field(
+        default_factory=lambda: float(os.getenv("TRAIN_SPLIT", "0.8"))
     )
-
-    # ── 训练 ──
-    train_split: float = 0.8
-    val_split: float = 0.0
-    test_split: float = 0.2
+    val_split: float = field(
+        default_factory=lambda: float(os.getenv("VAL_SPLIT", "0.1"))
+    )
+    test_split: float = field(
+        default_factory=lambda: float(os.getenv("TEST_SPLIT", "0.1"))
+    )
     random_state: int = 42
 
 
