@@ -248,7 +248,14 @@ def _stringify_for_log(parsed):
 
 
 def _load_test_df() -> pd.DataFrame | None:
-    """Load the evaluation slice from the training CSV."""
+    """Load the configured evaluation test split."""
+    test_split_path = Path(settings.test_split_jsonl)
+    if settings.eval_use_test_split_jsonl and test_split_path.is_file():
+        df = pd.read_json(test_split_path, lines=True)
+        df = df.reset_index(drop=True)
+        print(f"[Eval] loaded {len(df)} rows from {test_split_path}")
+        return df
+
     csv_path = str(settings.train_csv)
     if not os.path.isfile(csv_path):
         print(f"[ERROR] training data file not found: {csv_path}")

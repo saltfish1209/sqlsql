@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 
 from openai import AsyncOpenAI, APIConnectionError
 
 from config.settings import settings
 from pipeline.fewshot_index import FewShotFaissStore
+from pipeline.schema_format import build_light_schema_markdown, enrich_schema_columns
 from pipeline.utils import TokenTracker, debug_print
 
 
@@ -58,6 +58,24 @@ class SQLGenerator:
         return m.group(1).strip() if m else text.strip()
 
     @staticmethod
+    def highlight_question_for_prompt(question: str) -> str:
+        """在 prompt 中加粗问题全文，提醒模型以问题原文为字面量来源。"""
+        text = str(question or "").strip()
+        return f"**{text}**" if text else ""
+
+    @staticmethod
+    def _sql_generation_rules() -> str:
+        return (
+            "要求：\n"
+            "1. 不要重新做 schema linking。\n"
+            "2. WHERE/HAVING 中的编码、单号、名称等过滤值必须来自【用户问题】原文，"
+            "**严禁使用 Schema 示例值、枚举值或范围中的数字替代问题字面量**。\n"
+            "3. 业务编码/单号列（如物料编码、采购订单号）请用带引号的文本字面量，例如 `\"物料编码\" = '500138627'`。\n"
+            "4. 结果行如存在多条重复值，请优先考虑使用 DISTINCT 去重。\n"
+            "5. 只输出 SQL，用 ```sql 包裹。\n"
+        )
+
+    @staticmethod
     def build_m_schema_prompt(
         selected_columns: list[dict],
         all_metadata: list[dict],
@@ -69,46 +87,8 @@ class SQLGenerator:
         if randomize:
             import random
             random.shuffle(cols)
-        metadata_map = {str(m.get("column_name") or m.get("列名") or ""): m for m in (all_metadata or [])}
-        lines = [f"[数据库表] {table_name}", "[候选字段]"]
-        for meta in cols:
-            col_name = meta.get("列名") or meta.get("column_name") or ""
-            if not col_name:
-                continue
-            schema_meta = metadata_map.get(col_name, {})
-            profiler_meta = (profile_detail_map or {}).get(col_name, {})
-
-            col_desc = str(schema_meta.get("column_description") or meta.get("列描述") or "").strip()
-            field_type = profiler_meta.get("字段类型") if profiler_meta.get("字段类型") not in (None, "") else meta.get("字段类型")
-            is_enum = profiler_meta.get("是否枚举") if profiler_meta.get("是否枚举") not in (None, "") else meta.get("是否枚举")
-            null_ratio = profiler_meta.get("空值率") if profiler_meta.get("空值率") not in (None, "") else meta.get("空值率")
-            distinct_count = profiler_meta.get("唯一值数") if profiler_meta.get("唯一值数") not in (None, "") else meta.get("唯一值数")
-            sample_values = profiler_meta.get("示例值") if profiler_meta.get("示例值") not in (None, "") else meta.get("示例值")
-            value_format = profiler_meta.get("格式") if profiler_meta.get("格式") not in (None, "") else meta.get("格式")
-            value_range = profiler_meta.get("范围") if profiler_meta.get("范围") not in (None, "") else meta.get("范围")
-
-            if isinstance(sample_values, list):
-                sample_values = "/".join(str(x) for x in sample_values if str(x).strip())
-
-            row_parts = [f"列名={col_name}"]
-            if col_desc:
-                row_parts.append(f"描述={col_desc}")
-            if field_type not in (None, ""):
-                row_parts.append(f"类型={field_type}")
-            if is_enum not in (None, ""):
-                row_parts.append(f"枚举={is_enum}")
-            if null_ratio not in (None, ""):
-                row_parts.append(f"空值率={null_ratio}")
-            if distinct_count not in (None, ""):
-                row_parts.append(f"唯一值数={distinct_count}")
-            if sample_values not in (None, ""):
-                row_parts.append(f"示例={sample_values}")
-            if value_format not in (None, ""):
-                row_parts.append(f"格式={value_format}")
-            if value_range not in (None, ""):
-                row_parts.append(f"范围={value_range}")
-            lines.append("- " + " | ".join(row_parts))
-        return "\n".join(lines)
+        enriched = enrich_schema_columns(cols, all_metadata or [], profile_detail_map)
+        return build_light_schema_markdown(enriched, table_name)
 
     async def _call_llm_sql(
         self,
@@ -163,27 +143,22 @@ class SQLGenerator:
         self,
         question: str,
         schema_prompt: str,
-        plan_json: dict,
         tracker: TokenTracker,
     ) -> dict | None:
         fewshot_context = self._build_fewshot_context(question)
         fewshot_block = f"[Few-shot示例]\n{fewshot_context}\n\n" if fewshot_context else ""
+        highlighted_question = self.highlight_question_for_prompt(question)
 
         base_prompt = (
-            "你是一名SQL专家。请只基于给定的结构化 JSON 和 Schema 生成一条 SQLite SQL。\n\n"
+            "你是一名SQL专家。请只基于给定的 Schema 生成一条 SQLite SQL。\n\n"
             + fewshot_block
             + f"[Schema]\n{schema_prompt}\n"
-            + f"[JSON]\n{json.dumps(plan_json, ensure_ascii=False)}\n"
-            + f"[用户问题]\n{question}\n"
-            + "要求：\n"
-            "1. 不要重新做 schema linking。\n"
-            "2. 不要重新抽实体。\n"
-            "3. 结果行如存在多条重复值，请优先考虑使用 DISTINCT 去重。\n"
-            "4. 只输出 SQL，用 ```sql 包裹。\n"
+            + f"[用户问题]\n{highlighted_question}\n"
+            + self._sql_generation_rules()
         )
 
-        prompt_direct = base_prompt + "\n[路径提示] 直接根据当前 JSON 生成最简洁 SQL。"
-        prompt_icl = base_prompt + "\n[路径提示] 参考 JSON 中的字段语义，优先确保过滤条件完整。"
+        prompt_direct = base_prompt + "\n[路径提示] 直接根据 Schema 与加粗问题原文生成最简洁 SQL。"
+        prompt_icl = base_prompt + "\n[路径提示] 参考字段语义，过滤条件必须逐字来自加粗问题原文。"
         prompt_plan = base_prompt + (
             "\n[路径提示] 在生成最终 SQL 前，必须先给出结构化 Plan，再给出唯一 SQL。\n"
             "在生成最终的 SQL 之前，请严格按照以下 4 个步骤输出你的规划分析（Plan）：\n\n"
@@ -191,7 +166,7 @@ class SQLGenerator:
             "1. 【核心意图】：用户到底想查什么？（例如：求和、计数、最值、条件罗列、比例推算？）\n"
             "2. 【列与实体映射】：\n"
             "   - SELECT 目标列：___\n"
-            "   - WHERE 条件列：___ (参考实体对齐结果，必须使用数据库真实存在的对应匹配值)\n"
+            "   - WHERE 条件列：___ (过滤值必须来自加粗问题原文，禁止使用 Schema 示例值)\n"
             "   - GROUP BY/ORDER BY 列 (如果需要)：___\n"
             "3. 【逻辑陷阱排查】：\n"
             "   - 是否需要过滤空值 (IS NOT NULL)？\n"
@@ -212,27 +187,24 @@ class SQLGenerator:
         valid = [r for r in results if r and r.get("sql")]
         if not valid:
             return None
-        best = valid[0]
-        best["plan_json"] = plan_json
-        return best
+        return valid[0]
 
     async def start_candidate_tasks(
         self,
         question: str,
         schema_prompt: str,
-        plan_json: dict,
         tracker: TokenTracker,
     ) -> list[asyncio.Task]:
         fewshot_context = self._build_fewshot_context(question)
         fewshot_block = f"[Few-shot示例]\n{fewshot_context}\n\n" if fewshot_context else ""
 
+        highlighted_question = self.highlight_question_for_prompt(question)
         base_prompt = (
-            "你是一名SQL专家。请只基于给定的结构化 JSON 和 Schema 生成一条 SQLite SQL。\n\n"
+            "你是一名SQL专家。请只基于给定的 Schema 生成一条 SQLite SQL。\n\n"
             + fewshot_block
             + f"[Schema]\n{schema_prompt}\n"
-            + f"[JSON]\n{json.dumps(plan_json, ensure_ascii=False)}\n"
-            + f"[用户问题]\n{question}\n"
-            + "要求：只输出 SQL，用 ```sql 包裹。"
+            + f"[用户问题]\n{highlighted_question}\n"
+            + self._sql_generation_rules()
         )
         return [
             asyncio.create_task(self._call_llm_sql(base_prompt + "\n[路径提示] direct", tracker, settings.direct_temperature, "direct")),
@@ -244,9 +216,8 @@ class SQLGenerator:
         self,
         question: str,
         schema_prompt: str,
-        plan_json: dict,
         tracker: TokenTracker,
     ) -> list[dict]:
-        tasks = await self.start_candidate_tasks(question, schema_prompt, plan_json, tracker)
+        tasks = await self.start_candidate_tasks(question, schema_prompt, tracker)
         results = await asyncio.gather(*tasks)
         return [r for r in results if r and r.get("sql")]

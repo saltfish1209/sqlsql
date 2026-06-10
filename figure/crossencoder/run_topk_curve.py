@@ -33,16 +33,16 @@ def main() -> None:
         ks = tuple(int(x) for x in args.ks.split(",") if x.strip())
 
     rows = evaluate_cross_encoder_multi_k(args.model_path, split=args.split, top_ks=ks)
-    fields = ["model_path", "split", "top_k", "total", "success", "recall_at_k"]
+    fields = ["model_path", "split", "top_k", "total", "success", "recall_at_k", "ndcg"]
     with TOPK_CURVE_CSV.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for r in rows:
-            writer.writerow({k: r[k] for k in fields})
+            writer.writerow({k: r.get(k) for k in fields})
 
     print(f"模型: {args.model_path}")
     for r in rows:
-        print(f"  K={r['top_k']:2d}  Recall@K={r['recall_at_k']:.2%}")
+        print(f"  K={r['top_k']:2d}  Recall@K={r['recall_at_k']:.2%}  NDCG@K={r.get('ndcg', 0):.4f}")
     print(f"已写入: {TOPK_CURVE_CSV}")
 
 

@@ -16,8 +16,8 @@ import pandas as pd
 
 from config.settings import settings
 from pipeline.cross_encoder_passage import build_column_passage
-from pipeline.profiler import DatabaseProfiler
-from pipeline.utils import debug_print
+from pipeline.profiler import DatabaseProfiler, apply_instance_fields
+from pipeline.utils import debug_print, to_halfwidth
 
 try:
     import faiss
@@ -48,11 +48,11 @@ class CandidateSchemaPack:
 
 
 def _normalize_lsh_text(s: str) -> str:
-    return re.sub(r"[^\w]", "", str(s)).upper()
+    return re.sub(r"[^\w]", "", to_halfwidth(str(s))).upper()
 
 
 def _normalize_text(s: Any) -> str:
-    return "".join(str(s or "").split()).lower()
+    return "".join(to_halfwidth(str(s or "")).split()).lower()
 
 
 def _find_exact_column_name_mentions(question: str, column_names: list[str]) -> list[str]:
@@ -164,6 +164,11 @@ class SchemaLinker:
         parsed_metadata = _parse_m_schema(self.schema_text)
         self.df = pd.read_csv(self.csv_path, dtype=str, keep_default_na=False, na_values=[""])
         csv_columns = {str(col).strip() for col in self.df.columns if str(col).strip()}
+        csv_columns_by_norm: dict[str, str] = {}
+        for col in self.df.columns:
+            col_name = str(col).strip()
+            if col_name:
+                csv_columns_by_norm.setdefault(_normalize_text(col_name), col_name)
         raw_schema_count = len(parsed_metadata)
         self.profiler = DatabaseProfiler(csv_path=self.csv_path)
         self._profiles = self.profiler.profile_all()
@@ -171,23 +176,25 @@ class SchemaLinker:
         self.profile_detail_map = self.profiler.get_profile_detail_map(self._profiles)
         schema_not_in_raw: list[str] = []
         high_null_ratio: list[str] = []
+        active_metadata: list[dict] = []
         threshold = float(getattr(settings, "deprecated_column_null_ratio_threshold", 0.95))
         for meta in parsed_metadata:
-            col = str(meta.get("column_name", "")).strip()
+            raw_col = str(meta.get("column_name", "")).strip()
+            if not raw_col:
+                continue
+            col = csv_columns_by_norm.get(_normalize_text(raw_col))
             if not col:
+                schema_not_in_raw.append(raw_col)
                 continue
-            if col not in csv_columns:
-                schema_not_in_raw.append(col)
-                continue
+            meta = dict(meta)
+            meta["column_name"] = col
             detail = self.profile_detail_map.get(col, {})
             if _parse_ratio(detail.get("空值率")) >= threshold:
                 high_null_ratio.append(col)
+                continue
+            active_metadata.append(meta)
         deprecated_columns = set(schema_not_in_raw) | set(high_null_ratio)
-        self.column_metadata = [
-            m for m in parsed_metadata
-            if str(m.get("column_name", "")).strip() in csv_columns
-            and str(m.get("column_name", "")).strip() not in deprecated_columns
-        ]
+        self.column_metadata = active_metadata
         self.column_names = [c["column_name"] for c in self.column_metadata]
         self.column_passage_map = {
             meta["column_name"]: build_column_passage(meta, self.profile_detail_map.get(meta["column_name"], {}))
@@ -231,41 +238,31 @@ class SchemaLinker:
         self._ensure_rank_model()
 
     def _rank_candidates(self, items: list[dict], top_k: int | None = None) -> list[dict]:
+        """在 TopK 候选内用纯最大相对跌幅断崖截断，不使用 min_ratio / protect_ratio。"""
         if not items:
             return []
         sorted_items = sorted(items, key=lambda x: (-(float(x.get("相关性分数") or 0.0)), x.get("列名", "")))
-        best_score = float(sorted_items[0].get("相关性分数") or 0.0)
-        if best_score <= 0:
-            return sorted_items[: (top_k or settings.candidate_top_k)]
-
-        min_score = best_score * float(getattr(settings, "candidate_cliff_min_ratio", 0.15))
-        protect_score = best_score * float(getattr(settings, "candidate_cliff_protect_ratio", 0.4))
-        decay_threshold = float(getattr(settings, "candidate_cliff_decay_threshold", 0.5))
         target_k = top_k or settings.candidate_top_k
+        window = sorted_items[:target_k]
+        if len(window) <= 1:
+            return window
 
-        filtered = [item for item in sorted_items if float(item.get("相关性分数") or 0.0) >= min_score]
-        if not filtered:
-            return sorted_items[:target_k]
+        best_score = float(window[0].get("相关性分数") or 0.0)
+        if best_score <= 0:
+            return window
 
-        cutoff = len(filtered)
-        for idx in range(len(filtered) - 1):
-            cur = float(filtered[idx].get("相关性分数") or 0.0)
-            nxt = float(filtered[idx + 1].get("相关性分数") or 0.0)
+        cliff_idx = 0
+        max_decay = -1.0
+        for idx in range(len(window) - 1):
+            cur = float(window[idx].get("相关性分数") or 0.0)
+            nxt = float(window[idx + 1].get("相关性分数") or 0.0)
             if cur <= 0:
                 continue
-            decay_rate = (cur - nxt) / cur
-            if cur >= protect_score or nxt >= protect_score:
-                continue
-            if decay_rate >= decay_threshold:
-                cutoff = idx + 1
-                break
-
-        cliff_selected = filtered[:cutoff]
-        if len(cliff_selected) >= target_k:
-            return cliff_selected[:target_k]
-        if len(filtered) >= target_k:
-            return filtered[:target_k]
-        return cliff_selected
+            decay = (cur - nxt) / cur
+            if decay > max_decay:
+                max_decay = decay
+                cliff_idx = idx
+        return window[: cliff_idx + 1]
 
     def _ensure_rank_model(self) -> None:
         if CrossEncoder is None:
@@ -350,7 +347,10 @@ class SchemaLinker:
         debug_print(f"[Schema][Cache] exact={exact_path.exists()}, lsh={lsh_path.exists()}, semantic={semantic_path.exists()}")
         if self._load_indexes(exact_path, lsh_path, semantic_path):
             self.cache_status.update({"exact_index": True, "lsh_index": True, "semantic_value_index": True})
+            self._load_faiss_index()
             debug_print("[Schema][Cache] 已命中全部索引缓存，直接加载。")
+            if self.faiss_index is not None:
+                debug_print(f"[Schema][Cache] faiss_index 已加载，向量数={self.faiss_index.ntotal}")
             return
         debug_print("[Schema][Cache] 未命中完整缓存，开始重建索引。")
         self._build_indexes()
@@ -371,7 +371,9 @@ class SchemaLinker:
             if MinHash is not None and MinHashLSH is not None:
                 lsh = MinHashLSH(threshold=settings.lsh_threshold, num_perm=settings.lsh_num_perm)
             for val in values.unique():
-                self.exact_index.setdefault(val, set()).add(col)
+                for key in dict.fromkeys([str(val).strip(), _normalize_text(val)]):
+                    if key:
+                        self.exact_index.setdefault(key, set()).add(col)
                 if lsh is None:
                     continue
                 norm = _normalize_lsh_text(val)
@@ -432,6 +434,7 @@ class SchemaLinker:
         try:
             with open(exact_path, "rb") as f:
                 self.exact_index = pickle.load(f)
+            self.exact_index = self._normalize_exact_index_keys(self.exact_index)
             if lsh_path.exists():
                 with open(lsh_path, "rb") as f:
                     self.lsh_index = pickle.load(f)
@@ -448,6 +451,15 @@ class SchemaLinker:
         except Exception as exc:
             debug_print(f"[Schema][Cache] 缓存加载失败：{type(exc).__name__}: {exc}")
             return False
+
+    @staticmethod
+    def _normalize_exact_index_keys(exact_index: dict[str, set[str]]) -> dict[str, set[str]]:
+        normalized: dict[str, set[str]] = {}
+        for key, cols in (exact_index or {}).items():
+            for norm_key in dict.fromkeys([str(key).strip(), _normalize_text(key)]):
+                if norm_key:
+                    normalized.setdefault(norm_key, set()).update(cols)
+        return normalized
 
     @staticmethod
     def _lsh_secondary_verify(norm_kw: str, norm_val: str) -> bool:
@@ -543,6 +555,8 @@ class SchemaLinker:
         return mh
 
     def _search_faiss_semantic(self, keyword: str, top_k: int | None = None) -> list[dict]:
+        if self.faiss_index is None:
+            self._load_faiss_index()
         if faiss is None or self.faiss_index is None or not self.faiss_index_meta:
             return []
         model = self._get_semantic_value_model()
@@ -593,9 +607,7 @@ class SchemaLinker:
             unique_count = prof.get("唯一值数")
             if unique_count not in (None, "") and int(unique_count) <= 20:
                 item["唯一值数"] = unique_count
-            samples = prof.get("示例值")
-            if samples not in (None, "", []):
-                item["示例值"] = samples[:3] if isinstance(samples, list) else samples
+            apply_instance_fields(item, prof)
             if prof.get("格式") not in (None, ""):
                 item["格式"] = prof.get("格式")
             if prof.get("范围") not in (None, ""):
@@ -611,55 +623,54 @@ class SchemaLinker:
             "模糊匹配": {},
             "向量匹配": {},
         }
-        for ent in entities:
-            ent_norm = _normalize_text(ent)
-            if not ent_norm:
-                continue
-            exact_hits: list[dict] = []
-            if ent in self.exact_index:
-                for c in self.exact_index[ent]:
-                    exact_hits.append({"实体文本": ent, "对应匹配值": ent, "所在匹配列": c, "匹配方式": "精确匹配", "相关性分数": 1.0})
-            if exact_hits:
-                deduped = self._dedupe_alignments(exact_hits)
-                evidence["精确匹配"][ent] = deduped
-                must_have.extend([x["所在匹配列"] for x in deduped])
-                continue
-
-            fuzzy_candidates: list[dict] = []
-            for meta in self.column_metadata:
-                col = meta["column_name"]
-                for ex in list(self._value_index.get(col, [])[: settings.candidate_value_top_k]):
-                    ex_norm = _normalize_text(ex)
-                    if not ex_norm:
+        if settings.enable_entity_extraction:
+            for ent in entities:
+                ent_norm = _normalize_text(ent)
+                if not ent_norm:
+                    continue
+                exact_hits: list[dict] = []
+                for exact_key in dict.fromkeys([ent, to_halfwidth(ent), ent_norm]):
+                    if exact_key not in self.exact_index:
                         continue
-                    if ex in self.exact_index:
-                        continue
-                    seq = _safe_ratio(ent_norm, ex_norm)
-                    jac = _char_jaccard(ent_norm, ex_norm)
-                    combined = 0.7 * seq + 0.3 * jac
-                    if combined >= settings.lsh_query_combined_threshold:
-                        fuzzy_candidates.append({"实体文本": ent, "对应匹配值": ex, "所在匹配列": col, "匹配方式": "模糊匹配", "相关性分数": round(float(combined), 4)})
-                        break
-            lsh_hits = self._search_lsh_fuzzy_candidates(ent)
-            fuzzy_candidates.extend(lsh_hits)
-            if fuzzy_candidates:
-                fuzzy_candidates = self._dedupe_alignments(fuzzy_candidates)
-                evidence["模糊匹配"][ent] = fuzzy_candidates
-                must_have.extend([x["所在匹配列"] for x in fuzzy_candidates])
+                    for c in self.exact_index[exact_key]:
+                        exact_hits.append({"实体文本": ent, "对应匹配值": ent, "所在匹配列": c, "匹配方式": "精确匹配", "相关性分数": 1.0})
+                if exact_hits:
+                    deduped = self._dedupe_alignments(exact_hits)
+                    evidence["精确匹配"][ent] = deduped
+                    must_have.extend([x["所在匹配列"] for x in deduped])
+                    continue
 
-            if settings.enable_semantic_value_retrieval and self.faiss_index is not None and self._is_text_query(ent):
-                sem_hits = self._search_faiss_semantic(ent)
-                for hit in sem_hits:
-                    evidence["向量匹配"].setdefault(ent, []).append(hit)
-                    must_have.append(hit["所在匹配列"])
+                fuzzy_candidates: list[dict] = []
+                for meta in self.column_metadata:
+                    col = meta["column_name"]
+                    for ex in list(self._value_index.get(col, [])[: settings.candidate_value_top_k]):
+                        ex_norm = _normalize_text(ex)
+                        if not ex_norm:
+                            continue
+                        if ex in self.exact_index or ex_norm in self.exact_index:
+                            continue
+                        seq = _safe_ratio(ent_norm, ex_norm)
+                        jac = _char_jaccard(ent_norm, ex_norm)
+                        combined = 0.7 * seq + 0.3 * jac
+                        if combined >= settings.lsh_query_combined_threshold:
+                            fuzzy_candidates.append({"实体文本": ent, "对应匹配值": ex, "所在匹配列": col, "匹配方式": "模糊匹配", "相关性分数": round(float(combined), 4)})
+                            break
+                lsh_hits = self._search_lsh_fuzzy_candidates(ent)
+                fuzzy_candidates.extend(lsh_hits)
+                if fuzzy_candidates:
+                    fuzzy_candidates = self._dedupe_alignments(fuzzy_candidates)
+                    evidence["模糊匹配"][ent] = fuzzy_candidates
+                    must_have.extend([x["所在匹配列"] for x in fuzzy_candidates])
 
-        must_have = list(dict.fromkeys(must_have))
+                if settings.enable_semantic_value_retrieval and self.faiss_index is not None and self._is_text_query(ent):
+                    sem_hits = self._search_faiss_semantic(ent)
+                    for hit in sem_hits:
+                        evidence["向量匹配"].setdefault(ent, []).append(hit)
+                        must_have.append(hit["所在匹配列"])
 
-        top20_set = set(top20_cols)
-        missing_name_hits = [c for c in exact_mentioned_columns if c not in top20_set]
-        if missing_name_hits:
-            debug_print(f"[Schema][NameMatch] 命中字段未进入重排候选，加入必须列: {missing_name_hits}")
-            must_have.extend(missing_name_hits)
+        if exact_mentioned_columns:
+            debug_print(f"[Schema][NameMatch] 问题中命中完整字段名，加入 must_have: {exact_mentioned_columns}")
+            must_have.extend(exact_mentioned_columns)
 
         must_have = list(dict.fromkeys(must_have))
 
@@ -745,9 +756,7 @@ class SchemaLinker:
                 unique_count = prof.get("唯一值数")
                 if unique_count not in (None, "") and int(unique_count) <= 20:
                     item["唯一值数"] = unique_count
-                samples = prof.get("示例值")
-                if samples not in (None, "", []):
-                    item["示例值"] = samples[:3] if isinstance(samples, list) else samples
+                apply_instance_fields(item, prof)
                 if prof.get("格式") not in (None, ""):
                     item["格式"] = prof.get("格式")
                 if prof.get("范围") not in (None, ""):
@@ -757,10 +766,22 @@ class SchemaLinker:
 
     def _format_entity_alignment_for_llm(self, evidence: dict) -> list[dict]:
         out = []
-        for ent, items in evidence.get("精确匹配", {}).items():
-            merged = items + evidence.get("模糊匹配", {}).get(ent, []) + evidence.get("向量匹配", {}).get(ent, [])
+        entity_keys = []
+        for match_map in (
+            evidence.get("精确匹配", {}),
+            evidence.get("模糊匹配", {}),
+            evidence.get("向量匹配", {}),
+        ):
+            entity_keys.extend((match_map or {}).keys())
+        for ent in dict.fromkeys(entity_keys):
+            merged = (
+                evidence.get("精确匹配", {}).get(ent, [])
+                + evidence.get("模糊匹配", {}).get(ent, [])
+                + evidence.get("向量匹配", {}).get(ent, [])
+            )
             merged = self._dedupe_alignments(merged)
-            out.append({"实体文本": ent, "候选对齐": merged[:3]})
+            if merged:
+                out.append({"实体文本": ent, "候选对齐": merged[:3]})
         return out
 
     def build_llm_prompt_payload(self, pack: CandidateSchemaPack) -> dict:

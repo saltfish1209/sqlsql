@@ -31,6 +31,7 @@ from training.template_split import split_dataframe_by_template
 # 输出路径（统一改为 JSONL，避免单文件 JSON 写入被截断导致 UnicodeDecodeError）
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAIN_FILE = os.path.join(OUTPUT_DIR, "cross_encoder_train_data.jsonl")
+TRAIN_EVAL_FILE = os.path.join(OUTPUT_DIR, "cross_encoder_train_eval_data.jsonl")
 VAL_FILE = os.path.join(OUTPUT_DIR, "cross_encoder_val_data.jsonl")
 TEST_FILE = os.path.join(OUTPUT_DIR, "cross_encoder_test_data.jsonl")
 FILTER_REPORT_FILE = os.path.join(OUTPUT_DIR, "cross_encoder_column_filter_report.json")
@@ -439,6 +440,12 @@ def main():
         result = process_data(data, ALL_COLUMNS, passage_map, is_training=is_train)
         write_jsonl(path, result)
         print(f"  → {path} ({len(result)} 条)")
+
+    # 额外输出一份“评估格式”的训练集：
+    # 与 val/test 一致，每题一条，字段为 question + gold_columns。
+    train_eval = process_data(df_train, ALL_COLUMNS, passage_map, is_training=False)
+    write_jsonl(TRAIN_EVAL_FILE, train_eval)
+    print(f"  → {TRAIN_EVAL_FILE} ({len(train_eval)} 条, 评估格式)")
 
 
 if __name__ == "__main__":

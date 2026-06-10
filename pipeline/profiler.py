@@ -28,7 +28,21 @@ from typing import Any
 import pandas as pd
 
 from config.settings import settings
+from pipeline.column_types import NUMERIC_COLS_SET
 from pipeline.utils import debug_print
+
+
+def _format_numeric_bound(value: Any) -> str:
+    if value is None:
+        return ""
+    num = float(value)
+    if num == int(num):
+        return str(int(num))
+    return str(value)
+
+
+def _format_numeric_range(min_val: Any, max_val: Any) -> str:
+    return f"[{_format_numeric_bound(min_val)},{_format_numeric_bound(max_val)}]"
 
 
 class ColumnProfile:
@@ -89,9 +103,9 @@ class ColumnProfile:
             if 1 < self.distinct_count <= full_threshold:
                 parts.append(f"枚举值={'/'.join(all_vals)}")
             elif self.sample_values:
-                parts.append(f"示例={'/'.join(self.sample_values[:3])}")
+                parts.append(f"示例={'/'.join(self.sample_values[:settings.profile_example_k])}")
         elif self.sample_values:
-            parts.append(f"示例={'/'.join(self.sample_values[:3])}")
+            parts.append(f"示例={'/'.join(self.sample_values[:settings.profile_example_k])}")
         if self.dtype_inferred == "NUMERIC" and self.min_val is not None and self.max_val is not None:
             parts.append(f"范围=[{self.min_val},{self.max_val}]")
         if self.format_pattern:
@@ -104,6 +118,129 @@ _DATE_SLASH = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$")
 _DATE_DASH = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$")
 _PURE_DIGITS = re.compile(r"^\d+$")
 _CODE_PATTERN = re.compile(r"^[A-Za-z]\d+$")
+
+
+def _pick_k_from_list(values: list[str], k: int, rng: random.Random) -> list[str]:
+    pool = [str(v).strip() for v in values if str(v).strip()]
+    if not pool or k <= 0:
+        return []
+    if len(pool) <= k:
+        return pool
+    return rng.sample(pool, k)
+
+
+def _pick_by_frequency_tiers(top_values: list[tuple[str, int]], k: int, rng: random.Random) -> list[str]:
+    if not top_values or k <= 0:
+        return []
+    by_freq: dict[int, list[str]] = {}
+    for val, cnt in top_values:
+        text = str(val).strip()
+        if not text:
+            continue
+        by_freq.setdefault(int(cnt), []).append(text)
+    result: list[str] = []
+    for freq in sorted(by_freq.keys(), reverse=True):
+        tier = by_freq[freq]
+        needed = k - len(result)
+        if needed <= 0:
+            break
+        if len(tier) <= needed:
+            result.extend(tier)
+        else:
+            result.extend(rng.sample(tier, needed))
+    return result[:k]
+
+
+def pick_k_instance_values(
+    *,
+    is_enum: bool,
+    enum_values: list[str],
+    top_values: list[tuple[str, int]],
+    fallback_pool: list[str],
+    k: int | None = None,
+    rng: random.Random | None = None,
+    max_len: int = 25,
+) -> list[str]:
+    """为候选列选取 k 个实例值：枚举列取枚举值，非枚举列按频次优先、同频随机。"""
+    rng = rng or random.Random()
+    k = max(1, int(k if k is not None else settings.profile_example_k))
+
+    if is_enum and enum_values:
+        pool = _pick_k_from_list(enum_values, k, rng)
+    else:
+        pool = _pick_by_frequency_tiers(top_values, k, rng)
+
+    if len(pool) < k and fallback_pool:
+        existing = set(pool)
+        extras = [
+            str(v).strip()
+            for v in fallback_pool
+            if str(v).strip() and str(v).strip() not in existing
+        ]
+        needed = k - len(pool)
+        if extras:
+            pool.extend(rng.sample(extras, min(needed, len(extras))))
+
+    return [v[:max_len] for v in pool[:k]]
+
+
+def apply_instance_fields(
+    item: dict,
+    profile_detail: dict | None = None,
+    *,
+    k: int | None = None,
+    rng: random.Random | None = None,
+) -> None:
+    """枚举列只保留枚举值，非枚举列只保留示例值（二者互斥）。"""
+    prof = profile_detail or {}
+    enum_values = prof.get("枚举值") if prof.get("枚举值") not in (None, "", []) else item.get("枚举值")
+    if enum_values not in (None, "", []):
+        item["枚举值"] = enum_values
+        item.pop("示例值", None)
+        return
+    item.pop("枚举值", None)
+    examples = resolve_column_examples(item, prof, k=k, rng=rng)
+    if examples:
+        item["示例值"] = examples
+    else:
+        item.pop("示例值", None)
+
+
+def resolve_column_examples(
+    item: dict,
+    profile_detail: dict | None = None,
+    *,
+    k: int | None = None,
+    rng: random.Random | None = None,
+) -> list[str]:
+    """基于 profiler 明细或已合并列项，解析出 k 个实例值。"""
+    k = max(1, int(k if k is not None else settings.profile_example_k))
+    prof = profile_detail or {}
+    is_enum = str(prof.get("是否枚举") or item.get("是否枚举") or "").strip() == "是"
+    enum_values = prof.get("枚举值") if prof.get("枚举值") not in (None, "", []) else item.get("枚举值")
+    if is_enum and enum_values not in (None, "", []):
+        enum_list = enum_values if isinstance(enum_values, list) else [enum_values]
+        return pick_k_instance_values(
+            is_enum=True,
+            enum_values=[str(v) for v in enum_list],
+            top_values=[],
+            fallback_pool=[],
+            k=k,
+            rng=rng,
+        )
+
+    raw_examples = prof.get("示例值") if prof.get("示例值") not in (None, "", []) else item.get("示例值")
+    if raw_examples in (None, "", []):
+        return []
+    if isinstance(raw_examples, list):
+        pool = [str(v).strip() for v in raw_examples if str(v).strip()]
+    elif isinstance(raw_examples, str):
+        pool = [x.strip() for x in raw_examples.split("/") if x.strip()] if "/" in raw_examples else ([raw_examples.strip()] if raw_examples.strip() else [])
+    else:
+        pool = [str(raw_examples).strip()]
+    if len(pool) >= k:
+        return pool[:k]
+    return pool
 
 
 def _detect_format(values: list[str]) -> str:
@@ -167,12 +304,12 @@ class DatabaseProfiler:
             if enum_values:
                 row["枚举值"] = enum_values
                 row["是否枚举"] = "是"
+            elif p.sample_values:
+                row["示例值"] = p.sample_values[: settings.profile_example_k]
             if p.null_ratio > 0:
                 row["空值率"] = f"{p.null_ratio:.2%}" if p.total else "0.00%"
-            if p.distinct_count <= 20 and p.sample_values:
-                row["示例值"] = p.sample_values[:3]
-            if p.dtype_inferred == "NUMERIC" and p.min_val is not None and p.max_val is not None:
-                row["范围"] = f"[{p.min_val},{p.max_val}]"
+            if p.name in NUMERIC_COLS_SET and p.min_val is not None and p.max_val is not None:
+                row["范围"] = _format_numeric_range(p.min_val, p.max_val)
             detail[p.name] = row
         return detail
 
@@ -187,9 +324,8 @@ class DatabaseProfiler:
         non_null = non_null[non_null != ""]
         p.distinct_count = int(non_null.nunique())
 
-        # 类型推断
-        numeric_count = non_null.apply(self._is_numeric).sum()
-        if numeric_count / max(len(non_null), 1) > 0.8:
+        # 类型推断：仅白名单数值列标为 NUMERIC，业务编码列保持 TEXT
+        if col in NUMERIC_COLS_SET:
             p.dtype_inferred = "NUMERIC"
             nums = pd.to_numeric(non_null, errors="coerce").dropna()
             if len(nums):
@@ -210,24 +346,19 @@ class DatabaseProfiler:
         p.top_values = [(str(v), int(c)) for v, c in value_counts.items()]
 
         # ── 示例值（供 schema 注入）──────────────────────────────────────
-        # 规则：优先使用高频值；若高频值不足 2 个，从剩余唯一值中随机补齐至 2 个。
-        # 最终保留不超过 6 个值，截断过长的单个值（> 25 字符），避免 prompt 过宽。
-        _MAX_SAMPLE_LEN = 25
-        _TARGET_MIN = 2
-        _TARGET_MAX = 6
-
-        top_strs = [v for v, _ in p.top_values[:_TARGET_MAX]]
-        if len(top_strs) < _TARGET_MIN:
-            # 从不在高频列表中的唯一值里随机采样补充
-            top_set = set(top_strs)
-            extra_pool = [
-                v for v in non_null.unique().tolist()
-                if v not in top_set
-            ]
-            needed = _TARGET_MIN - len(top_strs)
-            top_strs += random.sample(extra_pool, min(needed, len(extra_pool)))
-        # 截断过长值，避免占用过多 token
-        p.sample_values = [v[:_MAX_SAMPLE_LEN] for v in top_strs[:_TARGET_MAX]]
+        # 枚举列取枚举值；非枚举列按频次优先，同频随机；默认 k=settings.profile_example_k。
+        is_enum = p.is_categorical and p.distinct_count <= full_threshold
+        enum_values = [v for v, _ in p.top_values] if is_enum else []
+        if is_enum and enum_values:
+            p.sample_values = []
+        else:
+            p.sample_values = pick_k_instance_values(
+                is_enum=False,
+                enum_values=[],
+                top_values=p.top_values,
+                fallback_pool=non_null.unique().tolist(),
+                k=settings.profile_example_k,
+            )
 
         # 格式检测
         p.format_pattern = _detect_format(non_null.head(50).tolist())

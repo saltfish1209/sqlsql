@@ -1,12 +1,12 @@
 """
 Baseline 评估脚本 —— 复用 ``training.evaluate.run_evaluation``。
 ─────────────────────────────────────────────────────────────────
-与 ``training/evaluate.py`` 使用完全一致的测试集切分（数据集后 10%），
+与 ``training/evaluate.py`` 使用完全一致的测试集（默认 data/test_split.jsonl），
 保证与主流程的对比公平。
 
 用法:
-    python baseline/evaluate.py --mode full --use-full-data --concurrency 4
-    python baseline/evaluate.py --mode pruned --use-full-data --concurrency 15 --enable-thinking
+    python baseline/evaluate.py --mode full --concurrency 4
+    python baseline/evaluate.py --mode pruned --concurrency 15 --enable-thinking
 """
 from __future__ import annotations
 
@@ -40,8 +40,8 @@ async def main() -> None:
     parser.add_argument(
         "--eval-csv",
         type=str,
-        default=str(Path(__file__).resolve().parent.parent / "data" / "train_dataset_template_only.csv"),
-        help="评测比对CSV路径，缺省使用 data/train_dataset_template_only.csv",
+        default="",
+        help="评测比对CSV路径；缺省使用 settings.test_split_jsonl",
     )
     parser.add_argument(
         "--use-full-data",
@@ -68,10 +68,13 @@ async def main() -> None:
     elif args.no_thinking:
         settings.baseline_enable_thinking = False
 
-    settings.train_csv = Path(args.eval_csv)
+    if args.eval_csv:
+        settings.train_csv = Path(args.eval_csv)
+        settings.eval_use_test_split_jsonl = False
     if args.use_full_data:
         settings.train_split = 0.0
         settings.val_split = 0.0
+        settings.eval_use_test_split_jsonl = False
 
     system = BaselineSystem(mode=args.mode)
     out_path = args.output or os.path.join(

@@ -1,5 +1,8 @@
 """
-CrossEncoder Top-K 全覆盖率评估 —— 验证 Schema Pruner 的召回能力。
+CrossEncoder Top-K 全覆盖率评估 —— 验证 Schema Pruner 的部署级召回能力。
+
+此脚本用于推理/部署阶段评估，在具体 K 值下的 Recall 与 NDCG。
+训练阶段的指标对比请使用 evaluate_cross_encoder.py。
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from sentence_transformers import CrossEncoder
 sys.path.insert(0, str(os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))))
 from config.settings import settings
 from pipeline.cross_encoder_passage import build_column_passage_map
+from training.ranking_metrics import compute_mrr, compute_ndcg
 from training.dataset_io import read_jsonl
 
 TEST_FILE_JSONL = os.path.join(os.path.dirname(__file__), "cross_encoder_test_data.jsonl")
@@ -62,6 +66,8 @@ def evaluate():
         return
 
     success = total = 0
+    ndcg_scores: list[float] = []
+    mrr_scores: list[float] = []
     for i, item in enumerate(test_data):
         question = item["question"]
         gold = set(item["gold_columns"])
@@ -69,21 +75,28 @@ def evaluate():
             continue
         inputs = [[question, passage_map[col]] for col in all_cols]
         scores = model.predict(inputs, batch_size=32)
-        top_idx = np.argsort(scores)[::-1][:TOP_K]
-        pred = set(all_cols[j] for j in top_idx)
-        hit = gold.issubset(pred)
+        sorted_idx = np.argsort(scores)[::-1]
+        ranked_cols = [all_cols[j] for j in sorted_idx]
+        top_pred = set(ranked_cols[:TOP_K])
+        hit = gold.issubset(top_pred)
         if hit:
             success += 1
         total += 1
+        ndcg_scores.append(compute_ndcg(ranked_cols, gold, TOP_K))
+        mrr_scores.append(compute_mrr(ranked_cols, gold, TOP_K))
         if i < 3:
             print(f"\n[Case {i}] Q: {question}")
             print(f"  Gold: {gold}")
-            print(f"  Top-{TOP_K}: {list(pred)[:5]} ...")
+            print(f"  Top-{TOP_K}: {ranked_cols[:5]} ...")
             print(f"  {'OK' if hit else 'FAIL'}")
 
-    acc = success / total if total else 0
+    recall = success / total if total else 0
+    ndcg = float(np.mean(ndcg_scores)) if ndcg_scores else 0.0
+    mrr = float(np.mean(mrr_scores)) if mrr_scores else 0.0
     print(f"\n{'='*50}")
-    print(f"Top-{TOP_K} Full Recall: {acc:.2%} ({success}/{total})")
+    print(f"Top-{TOP_K} Full Recall: {recall:.2%} ({success}/{total})")
+    print(f"NDCG@{TOP_K}: {ndcg:.4f}")
+    print(f"MRR: {mrr:.4f}")
 
 
 if __name__ == "__main__":

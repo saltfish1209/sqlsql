@@ -78,11 +78,11 @@ def build_column_passage(meta: dict, profile_detail: dict | None = None) -> str:
     desc = str(meta.get("column_description") or meta.get("列描述") or "").strip()
     profile_detail = profile_detail or {}
 
-    examples: list[str] = []
-    examples.extend(_as_list(meta.get("examples") or meta.get("示例值")))
-    examples.extend(_as_list(profile_detail.get("枚举值")))
-    examples.extend(_as_list(profile_detail.get("示例值")))
-    examples = list(dict.fromkeys(examples))
+    enum_vals = _as_list(profile_detail.get("枚举值") or meta.get("枚举值"))
+    if enum_vals:
+        examples = list(dict.fromkeys(enum_vals))
+    else:
+        examples = list(dict.fromkeys(_as_list(meta.get("examples") or meta.get("示例值") or profile_detail.get("示例值"))))
 
     parts = [f"列名称: {col}"]
     if desc:

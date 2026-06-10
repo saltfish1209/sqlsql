@@ -51,6 +51,9 @@ class Settings:
     schema_path: Path = field(default_factory=lambda: DATA_DIR / "m_schema.txt")
     qa_template_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_template_only.csv")
     train_csv: Path = field(default_factory=lambda: DATA_DIR / "train_dataset_with_sql_and_slots.csv")
+    train_split_jsonl: Path = field(default_factory=lambda: DATA_DIR / "train_split.jsonl")
+    val_split_jsonl: Path = field(default_factory=lambda: DATA_DIR / "val_split.jsonl")
+    test_split_jsonl: Path = field(default_factory=lambda: DATA_DIR / "test_split.jsonl")
     table_name: str = "procurement_table"
     fewshot_index_dir: Path = field(default_factory=lambda: CACHE_DIR / "fewshot_index")
 
@@ -82,9 +85,6 @@ class Settings:
     # candidate_min_score: float = 0.18
     # candidate_max_columns: int = 18
     # 断崖法与比例截取参数（支持环境变量覆盖）
-    candidate_cliff_decay_threshold: float = field(
-        default_factory=lambda: float(os.getenv("CANDIDATE_CLIFF_DECAY_THRESHOLD", "0.6"))
-    )
     candidate_cliff_protect_ratio: float = field(
         default_factory=lambda: float(os.getenv("CANDIDATE_CLIFF_PROTECT_RATIO", "0.3"))
     )
@@ -92,7 +92,7 @@ class Settings:
         default_factory=lambda: float(os.getenv("CANDIDATE_CLIFF_MIN_RATIO", "0.05"))
     )
     candidate_top_k: int = field(
-        default_factory=lambda: int(os.getenv("CANDIDATE_TOP_K", "20"))
+        default_factory=lambda: int(os.getenv("CANDIDATE_TOP_K", "8"))
     )
     lsh_threshold: float = 0.62
     lsh_num_perm: int = 64
@@ -168,6 +168,9 @@ class Settings:
     entity_prefix_bracket: bool = field(
         default_factory=lambda: os.getenv("ENTITY_PREFIX_BRACKET", "False").lower() == "true"
     )
+    enable_entity_extraction: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_ENTITY_EXTRACTION", "False").lower() == "true"
+    )
 
     # ── Refiner / selector ──
     max_repair_retries: int = 2
@@ -178,6 +181,9 @@ class Settings:
     refiner_enforce_timeout: bool = field(
         default_factory=lambda: os.getenv("REFINER_ENFORCE_TIMEOUT", "False").lower() == "true"
     )
+    enable_sql_consistency_judge: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_SQL_CONSISTENCY_JUDGE", "True").lower() == "true"
+    )
     generator_prefix_code_fence: bool = field(
         default_factory=lambda: os.getenv("GEN_PREFIX_CODE_FENCE", "False").lower() == "true"
     )
@@ -186,6 +192,9 @@ class Settings:
     profile_sample_rows: int = 100
     profile_distinct_threshold: int = 80
     profile_enum_full_threshold: int = 15
+    profile_example_k: int = field(
+        default_factory=lambda: int(os.getenv("PROFILE_EXAMPLE_K", "2"))
+    )
     deprecated_column_null_ratio_threshold: float = field(
         default_factory=lambda: float(os.getenv("DEPRECATED_COLUMN_NULL_RATIO_THRESHOLD", "0.95"))
     )
@@ -209,6 +218,9 @@ class Settings:
     )
     test_split: float = field(
         default_factory=lambda: float(os.getenv("TEST_SPLIT", "0.1"))
+    )
+    eval_use_test_split_jsonl: bool = field(
+        default_factory=lambda: os.getenv("EVAL_USE_TEST_SPLIT_JSONL", "True").lower() == "true"
     )
     random_state: int = 42
 

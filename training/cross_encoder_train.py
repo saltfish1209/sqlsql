@@ -1,5 +1,8 @@
 """
 CrossEncoder 训练（支持环境变量超参、逐步 loss CSV、按 epoch 存 checkpoint）。
+
+训练北极星指标: NDCG@6 —— 衡量模型把 gold 列往前排的综合排序能力，
+不依赖单点 top_k 阈值。top_k 仅在推理/部署阶段作为业务参数使用。
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from config.settings import settings
 from training.cross_encoder_early_stop import early_stop_after_eval
 from training.cross_encoder_eval import evaluate_cross_encoder
 from training.dataset_io import read_jsonl
+from training.eval_schedule import should_run_mid_eval
 from training.prepare_data import print_column_filter_report
 from training.train_cross_encoder import (
     DEFAULT_DATALOADER_WORKERS,
@@ -41,6 +45,9 @@ from training.train_cross_encoder import (
 
 BASE_MODEL = str(settings.reranker_base_model)
 
+NDCG_EVAL_K = 6
+EVAL_EVERY_STEPS_AUTO = -1  # 按当前 epoch 步数的一半做中期 val；-1 为默认
+
 
 @dataclass
 class CrossEncoderTrainConfig:
@@ -54,10 +61,11 @@ class CrossEncoderTrainConfig:
     loss_log_path: str = ""
     log_every_steps: int = 20
     eval_split: str = "val"
-    eval_top_k: int = 0
+    eval_top_k: int = 6
     epoch_val_csv: str = ""
     early_stop_patience: int = 0  # 0 表示使用 figure.crossencoder.paths.get_early_stop_patience()
     early_stop_enabled: bool = True
+    eval_every_steps: int = EVAL_EVERY_STEPS_AUTO  # -1=每 epoch 半程；0=关闭；>0=每 N 步
 
 
 def _publish_checkpoint(src_dir: str, dest_dir: str) -> None:
@@ -71,6 +79,16 @@ def _publish_checkpoint(src_dir: str, dest_dir: str) -> None:
     shutil.copytree(src, dest)
 
 
+def _prune_previous_best_checkpoint(previous_ckpt_path: str, current_ckpt_path: str) -> None:
+    """只保留当前 best checkpoint，删除旧的 best 目录。"""
+    if not previous_ckpt_path:
+        return
+    if os.path.abspath(previous_ckpt_path) == os.path.abspath(current_ckpt_path):
+        return
+    if os.path.isdir(previous_ckpt_path):
+        shutil.rmtree(previous_ckpt_path, ignore_errors=True)
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -79,13 +97,8 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _default_eval_top_k() -> int:
-    """与 figure.crossencoder.paths.get_val_top_k 对齐。"""
-    try:
-        from figure.crossencoder.paths import get_val_top_k
-
-        return get_val_top_k()
-    except ImportError:
-        return 6
+    """NDCG 评估使用的 K 值（固定 6，不作为扫参变量）。"""
+    return NDCG_EVAL_K
 
 
 def _resolve_early_stop_patience(patience: int) -> int:
@@ -125,6 +138,7 @@ def config_from_env() -> CrossEncoderTrainConfig:
         early_stop_patience=_resolve_early_stop_patience(0),
         early_stop_enabled=os.getenv("NL2SQL_CE_EARLY_STOP", "1").strip().lower()
         not in {"0", "false", "no", "off"},
+        eval_every_steps=_env_int("NL2SQL_CE_EVAL_EVERY_STEPS", EVAL_EVERY_STEPS_AUTO),
     )
 
 
@@ -201,12 +215,24 @@ def train_cross_encoder(config: CrossEncoderTrainConfig | None = None) -> str:
     eval_k = cfg.eval_top_k if cfg.eval_top_k > 0 else _default_eval_top_k()
     do_epoch_val = bool(cfg.epoch_val_csv)
     do_early_stop = cfg.early_stop_enabled and do_epoch_val and cfg.early_stop_patience > 0
+    if cfg.eval_every_steps == 0:
+        mid_eval_steps = 0
+    elif cfg.eval_every_steps < 0:
+        mid_eval_steps = max(1, steps_per_epoch // 2)
+    else:
+        mid_eval_steps = cfg.eval_every_steps
     if do_epoch_val:
-        print(f"每 epoch val: split={cfg.eval_split} top_k={eval_k} -> {cfg.epoch_val_csv}")
+        if mid_eval_steps > 0:
+            print(
+                f"val 评估: 每 epoch 约 {mid_eval_steps} 步(半程) + epoch 末尾  "
+                f"NDCG@{eval_k} -> {cfg.epoch_val_csv}；第 1 epoch 中期 val 不计入早停"
+            )
+        else:
+            print(f"val 评估: 每 epoch 末尾  NDCG@{eval_k} -> {cfg.epoch_val_csv}")
     if do_early_stop:
         print(
             f"早停: patience={cfg.early_stop_patience} "
-            f"(连续 {cfg.early_stop_patience} 个 epoch val Recall@K 未创新高则停止)"
+            f"(连续 {cfg.early_stop_patience} 次 val NDCG@{eval_k} 未创新高则停止)"
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -235,23 +261,107 @@ def train_cross_encoder(config: CrossEncoderTrainConfig | None = None) -> str:
         "global_step_end",
         "pair_lambda",
         "pair_margin",
-        "top_k",
+        "eval_k",
         "split",
+        "ndcg",
+        "mrr",
         "recall_at_k",
         "total",
         "success",
         "model_path",
         "is_best",
+        "for_early_stop",
         "patience_counter",
         "stopped_early",
     ]
 
     global_step = 0
-    best_recall = -1.0
+    best_ndcg = -1.0
     best_ckpt_path = ""
-    best_epoch = 0
+    best_epoch_label = ""
     patience_counter = 0
     stopped_early = False
+    eval_count = 0
+
+    def _run_eval(label: str, save_dir: str = "", *, for_early_stop: bool = True) -> bool:
+        """直接用训练中的模型做 val；for_early_stop=False 时只记录指标，不参与早停。"""
+        nonlocal best_ndcg, best_ckpt_path, best_epoch_label
+        nonlocal patience_counter, stopped_early, eval_count
+        eval_count += 1
+        model.model.eval()
+        try:
+            with torch.no_grad():
+                metrics = evaluate_cross_encoder(
+                    split=cfg.eval_split, top_k=eval_k, model=model,
+                )
+        finally:
+            model.model.train()
+
+        current_ndcg = float(metrics["ndcg"])
+        current_mrr = float(metrics["mrr"])
+        current_recall = float(metrics["recall_at_k"])
+        should_stop = False
+        ckpt_path = ""
+
+        if for_early_stop:
+            is_best = current_ndcg > best_ndcg
+            if is_best:
+                best_ndcg = current_ndcg
+                best_epoch_label = label
+                patience_counter = 0
+                if save_dir:
+                    ckpt_path = os.path.join(save_dir, label)
+                    os.makedirs(ckpt_path, exist_ok=True)
+                    previous_best_ckpt = best_ckpt_path
+                    model.save(ckpt_path)
+                    _prune_previous_best_checkpoint(previous_best_ckpt, ckpt_path)
+                    best_ckpt_path = ckpt_path
+                    print(f"[{label}] 新最优，已保存 checkpoint: {ckpt_path}")
+            elif do_early_stop:
+                _, patience_counter, should_stop = early_stop_after_eval(
+                    current_metric=current_ndcg,
+                    best_metric=best_ndcg,
+                    patience_counter=patience_counter,
+                    patience=cfg.early_stop_patience,
+                )
+        else:
+            is_best = False
+
+        row = {
+            "epoch": label,
+            "global_step_end": global_step,
+            "pair_lambda": cfg.pair_lambda,
+            "pair_margin": cfg.pair_margin,
+            "eval_k": eval_k,
+            "split": cfg.eval_split,
+            "ndcg": round(current_ndcg, 6),
+            "mrr": round(current_mrr, 6),
+            "recall_at_k": round(current_recall, 6),
+            "total": metrics["total"],
+            "success": metrics["success"],
+            "model_path": ckpt_path or best_ckpt_path,
+            "is_best": int(is_best),
+            "for_early_stop": int(for_early_stop),
+            "patience_counter": patience_counter,
+            "stopped_early": int(should_stop),
+        }
+        _append_csv(cfg.epoch_val_csv, epoch_val_fields, row)
+        es_note = "" if for_early_stop else " (不计入早停)"
+        print(
+            f"[{label}] val NDCG@{eval_k}: {current_ndcg:.4f}  "
+            f"MRR: {current_mrr:.4f}  "
+            f"Recall@{eval_k}: {current_recall:.2%} ({metrics['success']}/{metrics['total']})"
+            f"{' [best]' if is_best else ''}"
+            f"  patience={patience_counter}/{cfg.early_stop_patience}{es_note}"
+        )
+
+        if for_early_stop and do_early_stop and should_stop:
+            stopped_early = True
+            print(
+                f"[EarlyStop] 连续 {patience_counter} 次 val "
+                f"NDCG@{eval_k} 未超过 best={best_ndcg:.4f} ({best_epoch_label})，停止训练"
+            )
+        return should_stop
 
     for epoch in range(cfg.epochs):
         for step, batch in enumerate(loader, start=1):
@@ -315,76 +425,37 @@ def train_cross_encoder(config: CrossEncoderTrainConfig | None = None) -> str:
                         },
                     )
 
-        ckpt_path = cfg.save_path
-        if cfg.checkpoint_dir:
-            ckpt_path = os.path.join(cfg.checkpoint_dir, f"epoch_{epoch + 1}")
-            os.makedirs(ckpt_path, exist_ok=True)
-        model.save(ckpt_path)
-        print(f"[Epoch {epoch + 1}] 已保存: {ckpt_path}")
-
-        if do_epoch_val:
-            model.model.cpu()
-            gc.collect()
-            torch.cuda.empty_cache()
-            try:
-                metrics = evaluate_cross_encoder(
-                    ckpt_path, split=cfg.eval_split, top_k=eval_k,
-                )
-            finally:
-                gc.collect()
-                torch.cuda.empty_cache()
-                model.model.to(device)
-                model.model.train()
-            current_recall = float(metrics["recall_at_k"])
-            is_best = current_recall > best_recall
-            should_stop = False
-            if is_best:
-                best_recall = current_recall
-                best_ckpt_path = ckpt_path
-                best_epoch = epoch + 1
-                patience_counter = 0
-            elif do_early_stop:
-                _, patience_counter, should_stop = early_stop_after_eval(
-                    current_recall=current_recall,
-                    best_recall=best_recall,
-                    patience_counter=patience_counter,
-                    patience=cfg.early_stop_patience,
-                )
-
-            row = {
-                "epoch": epoch + 1,
-                "global_step_end": global_step,
-                "pair_lambda": cfg.pair_lambda,
-                "pair_margin": cfg.pair_margin,
-                "top_k": eval_k,
-                "split": cfg.eval_split,
-                "recall_at_k": round(current_recall, 6),
-                "total": metrics["total"],
-                "success": metrics["success"],
-                "model_path": ckpt_path,
-                "is_best": int(is_best),
-                "patience_counter": patience_counter,
-                "stopped_early": int(should_stop),
-            }
-            _append_csv(cfg.epoch_val_csv, epoch_val_fields, row)
-            print(
-                f"[Epoch {epoch + 1}] val Recall@{eval_k}: "
-                f"{current_recall:.2%} ({metrics['success']}/{metrics['total']})"
-                f"{' [best]' if is_best else ''}"
-            )
-
-            if do_early_stop and should_stop:
-                stopped_early = True
-                print(
-                    f"[EarlyStop] epoch {epoch + 1} 起连续 {patience_counter} 个 epoch "
-                    f"未超过 best={best_recall:.2%} (epoch {best_epoch})，停止训练"
-                )
-                break
+            if do_epoch_val and should_run_mid_eval(
+                step=step,
+                steps_per_epoch=steps_per_epoch,
+                mid_eval_steps=mid_eval_steps,
+            ):
+                mid_label = f"E{epoch + 1}_S{step}"
+                if _run_eval(
+                    mid_label,
+                    save_dir=cfg.checkpoint_dir,
+                    for_early_stop=(epoch > 0),
+                ):
+                    break
+        else:
+            epoch_label = f"E{epoch + 1}"
+            if do_epoch_val:
+                if _run_eval(epoch_label, save_dir=cfg.checkpoint_dir):
+                    break
+            else:
+                ckpt_path = cfg.save_path
+                if cfg.checkpoint_dir:
+                    ckpt_path = os.path.join(cfg.checkpoint_dir, f"epoch_{epoch + 1}")
+                    os.makedirs(ckpt_path, exist_ok=True)
+                model.save(ckpt_path)
+                print(f"[Epoch {epoch + 1}] 已保存: {ckpt_path}")
+            continue
+        break
 
     if best_ckpt_path:
         _publish_checkpoint(best_ckpt_path, cfg.save_path)
         print(
-            f"最终模型已保存 (best epoch {best_epoch}, recall@{eval_k}={best_recall:.2%}): "
+            f"最终模型已保存 (best={best_epoch_label}, NDCG@{eval_k}={best_ndcg:.4f}): "
             f"{cfg.save_path}"
         )
         if stopped_early:

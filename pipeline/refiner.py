@@ -25,7 +25,8 @@ class SQLRefiner:
         top20_candidates: list[dict] | list[str],
         tracker: TokenTracker,
         max_retries: int | None = None,
-        plan_json: dict | None = None,
+        *,
+        repair_schema_prompt: str | None = None,
     ) -> list[dict]:
         refined = []
         for cand in candidates:
@@ -41,14 +42,25 @@ class SQLRefiner:
                 repaired["error_msg"] = self._format_checker_feedback(issues)
                 repaired.setdefault("result", None)
                 repaired["status"] = "needs_repair"
+                sql_before = repaired.get("sql")
                 repaired = await self._attempt_llm_repair(
-                    schema_prompt=schema_prompt,
+                    schema_prompt=repair_schema_prompt or schema_prompt,
                     candidate=repaired,
                     valid_columns=top20_candidates,
                     tracker=tracker,
                     max_retries=max_retries or settings.max_repair_retries,
-                    plan_json=plan_json or {},
+                    repair_reason="execution",
                 )
+                repaired["refiner_debug"] = {
+                    "check": self._issues_to_dict(issues),
+                    "refiner": {
+                        "sql_before": sql_before,
+                        "sql_after": repaired.get("sql"),
+                        "status": repaired.get("status"),
+                        "error_msg": repaired.get("error_msg"),
+                        "post_check": self._issues_to_dict(repaired.get("checker_issues") or []),
+                    },
+                }
                 refined.append(repaired)
             else:
                 repaired["status"] = "success"
@@ -63,6 +75,13 @@ class SQLRefiner:
             for issue in issues
         )
 
+    @staticmethod
+    def _issues_to_dict(issues: list[CheckIssue]) -> list[dict]:
+        return [
+            {"code": issue.code, "message": issue.message, "directive": issue.directive}
+            for issue in (issues or [])
+        ]
+
     async def _attempt_llm_repair(
         self,
         schema_prompt: str,
@@ -70,16 +89,27 @@ class SQLRefiner:
         valid_columns: list[dict] | list[str],
         tracker: TokenTracker,
         max_retries: int,
-        plan_json: dict,
+        *,
+        repair_reason: str = "execution",
     ) -> dict:
         sql = candidate.get("sql") or ""
-        prompt = (
-            "你是SQL修复专家。请根据错误SQL、错误原因和plan_json重新生成正确SQL。\n"
-            f"[错误SQL]\n{sql}\n"
-            f"[错误原因]\n{candidate.get('error_msg', '')}\n"
-            f"[plan_json]\n{json.dumps(plan_json or {}, ensure_ascii=False, indent=2)}\n"
-            "要求：只输出可执行SQL，用```sql包裹。"
-        )
+        if repair_reason == "semantic":
+            prompt = (
+                "你是SQL修复专家。当前 SQL 能执行，但语义审查认为其与用户问题不一致。\n"
+                "请基于断崖剪枝 Schema、用户问题、原 SQL 与执行结果，重新生成正确 SQL。\n"
+                f"[Schema]\n{schema_prompt}\n"
+                f"[错误SQL]\n{sql}\n"
+                f"[错误原因]\n{candidate.get('error_msg', '')}\n"
+                "要求：过滤值必须来自用户问题原文，禁止使用 Schema 示例值；只输出可执行 SQL，用```sql包裹。"
+            )
+        else:
+            prompt = (
+                "你是SQL修复专家。SQL 无法执行或 checker 报错，请基于 TopK 扩展 Schema 重新生成正确 SQL。\n"
+                f"[Schema]\n{schema_prompt}\n"
+                f"[错误SQL]\n{sql}\n"
+                f"[错误原因]\n{candidate.get('error_msg', '')}\n"
+                "要求：只输出可执行SQL，用```sql包裹。"
+            )
         try:
             resp = await self.client.chat.completions.create(
                 model=self.model,
@@ -104,6 +134,38 @@ class SQLRefiner:
             return candidate
         except Exception:
             return candidate
+
+    async def repair_semantic_async(
+        self,
+        cliff_schema_prompt: str,
+        candidate: dict,
+        *,
+        question: str,
+        tracker: TokenTracker,
+        judge_reason: str = "",
+    ) -> dict:
+        """SQL 可执行但语义不一致时，用断崖 schema + 问题 + SQL + 结果重生成。"""
+        repaired = dict(candidate)
+        result_preview = repaired.get("result")
+        if result_preview is None:
+            result_preview = []
+        preview_lines = []
+        for row in (result_preview or [])[:5]:
+            preview_lines.append(str(list(row) if isinstance(row, (list, tuple)) else row))
+        result_text = "\n".join(preview_lines) if preview_lines else "（空结果）"
+        repaired["error_msg"] = (
+            f"语义审查不一致: {judge_reason}\n"
+            f"[用户问题]\n{question}\n"
+            f"[SQL执行结果]\n{result_text}"
+        )
+        return await self._attempt_llm_repair(
+            schema_prompt=cliff_schema_prompt,
+            candidate=repaired,
+            valid_columns=[],
+            tracker=tracker,
+            max_retries=settings.max_repair_retries,
+            repair_reason="semantic",
+        )
 
     @staticmethod
     def _build_relaxed_recall_schema(recall_schema: list[dict]) -> list[dict]:
