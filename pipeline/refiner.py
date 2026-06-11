@@ -110,6 +110,13 @@ class SQLRefiner:
                 f"[错误原因]\n{candidate.get('error_msg', '')}\n"
                 "要求：只输出可执行SQL，用```sql包裹。"
             )
+        prompt += (
+            "\n[最小修改原则]\n"
+            "1. 只围绕错误原因修复，不要额外添加用户问题没有要求的过滤条件。\n"
+            "2. WHERE/HAVING 中的编号、单号、名称等过滤值必须来自用户问题原文或错误原因中明确指出的原文条件。\n"
+            "3. 不得使用 Schema 示例值、枚举值或其它候选值替换用户原文条件。\n"
+            "4. 如果错误是空结果，优先放宽过严条件，不要替换用户给出的编号或单号。\n"
+        )
         try:
             resp = await self.client.chat.completions.create(
                 model=self.model,

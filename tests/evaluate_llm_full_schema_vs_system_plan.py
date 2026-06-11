@@ -453,12 +453,13 @@ async def _run_linked_schema_from_stages(system, stages: dict) -> dict:
     candidate_pack = stages["candidate_pack"]
     schema_prompt = stages["schema_prompt"]
 
-    cand = await system.generator.generate_from_plan_async(
+    candidates = await system.generator.generate_candidates_async(
         stages["question"],
         schema_prompt,
         tracker,
+        intent_plan=stages.get("intent_plan"),
     )
-    if cand is None:
+    if not candidates:
         return {
             "final_sql": None,
             "execution_result": None,
@@ -468,14 +469,16 @@ async def _run_linked_schema_from_stages(system, stages: dict) -> dict:
             "stages": stages,
         }
 
-    cand["confidence"] = (
+    confidence = (
         float(candidate_pack.Top20候选[0]["相关性分数"])
         if candidate_pack.Top20候选
         else 0.0
     )
+    for cand in candidates:
+        cand["confidence"] = confidence
     refined = await system.refiner.refine_async(
         schema_prompt,
-        [cand],
+        candidates,
         candidate_pack.Top20候选,
         tracker,
         repair_schema_prompt=stages.get("repair_schema_prompt") or schema_prompt,
@@ -572,12 +575,13 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
     schema_prompt = stages["schema_prompt"]
     repair_schema_prompt = stages["repair_schema_prompt"]
 
-    cand = await system.generator.generate_from_plan_async(
+    candidates = await system.generator.generate_candidates_async(
         stages["question"],
         schema_prompt,
         tracker,
+        intent_plan=stages.get("intent_plan"),
     )
-    if cand is None:
+    if not candidates:
         return {
             "final_sql": None,
             "execution_result": None,
@@ -587,14 +591,16 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
             "stages": stages,
         }
 
-    cand["confidence"] = (
+    confidence = (
         float(candidate_pack.Top20候选[0]["相关性分数"])
         if candidate_pack.Top20候选
         else 0.0
     )
+    for cand in candidates:
+        cand["confidence"] = confidence
     refined = await system.refiner.refine_async(
         schema_prompt,
-        [cand],
+        candidates,
         candidate_pack.Top20候选,
         tracker,
         repair_schema_prompt=repair_schema_prompt,
@@ -642,12 +648,13 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
     candidate_pack = stages["candidate_pack"]
     schema_prompt = stages["schema_prompt"]
 
-    cand = await system.generator.generate_from_plan_async(
+    candidates = await system.generator.generate_candidates_async(
         stages["question"],
         schema_prompt,
         tracker,
+        intent_plan=stages.get("intent_plan"),
     )
-    if cand is None:
+    if not candidates:
         return {
             "final_sql": None,
             "execution_result": None,
@@ -657,16 +664,19 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
             "stages": stages,
         }
 
-    cand["confidence"] = (
+    confidence = (
         float(candidate_pack.Top20候选[0]["相关性分数"])
         if candidate_pack.Top20候选
         else 0.0
     )
-    prepared = _prepare_candidate_for_selector(system, cand)
+    prepared = []
+    for cand in candidates:
+        cand["confidence"] = confidence
+        prepared.append(_prepare_candidate_for_selector(system, cand))
     selected, reason, status = system.selector.select_best(
         stages["question"],
         schema_prompt,
-        [prepared],
+        prepared,
     )
     if selected is None:
         return {
@@ -751,17 +761,20 @@ async def _finalize_main_pipeline(
             "stages": stages,
         }
 
-    cand["confidence"] = (
+    generated_candidates = cand if isinstance(cand, list) else [cand]
+    confidence = (
         float(candidate_pack.Top20候选[0]["相关性分数"])
         if candidate_pack.Top20候选
         else 0.0
     )
+    for item in generated_candidates:
+        item["confidence"] = confidence
     if skip_refiner:
-        candidates = [_prepare_candidate_for_selector(system, cand)]
+        candidates = [_prepare_candidate_for_selector(system, item) for item in generated_candidates]
     else:
         candidates = await system.refiner.refine_async(
             schema_prompt,
-            [cand],
+            generated_candidates,
             candidate_pack.Top20候选,
             tracker,
             repair_schema_prompt=repair_schema_prompt,
@@ -802,6 +815,7 @@ async def _finalize_main_pipeline(
             schema_prompt=cliff_schema_prompt,
             sql=str(selected.get("sql") or ""),
             result=unique_rows if result else result,
+            intent_plan=stages.get("intent_plan"),
             tracker=tracker,
         )
         if not consistent:
@@ -846,10 +860,11 @@ async def _run_main_system_once(system, question: str, *, stages: dict | None = 
     repair_schema_prompt = stages["repair_schema_prompt"]
     cliff_schema_prompt = stages.get("cliff_schema_prompt") or schema_prompt
 
-    cand = await system.generator.generate_from_plan_async(
+    cand = await system.generator.generate_candidates_async(
         stages["question"],
         schema_prompt,
         tracker,
+        intent_plan=stages.get("intent_plan"),
     )
     return await _finalize_main_pipeline(
         system,
@@ -884,10 +899,11 @@ async def _run_main_with_schema_once(
     stages = dict(stages)
     stages["recall_schema"] = recall_schema
 
-    cand = await system.generator.generate_from_plan_async(
+    cand = await system.generator.generate_candidates_async(
         stages["question"],
         schema_prompt,
         tracker,
+        intent_plan=stages.get("intent_plan"),
     )
     return await _finalize_main_pipeline(
         system,
@@ -952,10 +968,11 @@ async def _run_main_no_judge_once(system, question: str, *, stages: dict | None 
     repair_schema_prompt = stages["repair_schema_prompt"]
     cliff_schema_prompt = stages.get("cliff_schema_prompt") or schema_prompt
 
-    cand = await system.generator.generate_from_plan_async(
+    cand = await system.generator.generate_candidates_async(
         stages["question"],
         schema_prompt,
         tracker,
+        intent_plan=stages.get("intent_plan"),
     )
     return await _finalize_main_pipeline(
         system,

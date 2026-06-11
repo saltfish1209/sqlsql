@@ -17,6 +17,15 @@ _JUDGE_SCHEMA = {
     "required": ["一致", "原因"],
 }
 
+_CHOICE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "best_index": {"type": "integer"},
+        "原因": {"type": "string"},
+    },
+    "required": ["best_index", "原因"],
+}
+
 
 def _format_sql_result(result: list | None, *, limit: int = 5) -> str:
     if not result:
@@ -54,6 +63,26 @@ def parse_judge_response(text: str) -> tuple[bool, str]:
     return bool(consistent), reason
 
 
+def parse_choice_response(text: str) -> tuple[int | None, str]:
+    if not text:
+        return None, ""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None, ""
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return None, ""
+    if not isinstance(obj, dict):
+        return None, ""
+    try:
+        idx = int(obj.get("best_index"))
+    except (TypeError, ValueError):
+        return None, str(obj.get("原因") or obj.get("reason") or "").strip()
+    return idx, str(obj.get("原因") or obj.get("reason") or "").strip()
+
+
 async def judge_sql_consistency(
     client: AsyncOpenAI,
     model: str,
@@ -62,6 +91,7 @@ async def judge_sql_consistency(
     schema_prompt: str,
     sql: str,
     result: list | None,
+    intent_plan: dict | None = None,
     tracker: TokenTracker | None = None,
 ) -> tuple[bool, str]:
     """判断可执行 SQL 的过滤/查询语义是否与问题原文一致。"""
@@ -70,6 +100,7 @@ async def judge_sql_consistency(
         "而不是偷换为 Schema 示例值或其它无关值。\n\n"
         f"[Schema（断崖剪枝列）]\n{schema_prompt}\n\n"
         f"[用户问题]\n{question}\n\n"
+        f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
         f"[SQL]\n{sql}\n\n"
         f"[SQL执行结果]\n{_format_sql_result(result)}\n\n"
         "审查要点：\n"
@@ -102,3 +133,65 @@ async def judge_sql_consistency(
     except Exception as exc:
         debug_print(f"[ConsistencyJudge] skipped: {type(exc).__name__}: {exc}")
         return True, ""
+
+
+async def choose_sql_candidate(
+    client: AsyncOpenAI,
+    model: str,
+    *,
+    question: str,
+    intent_plan: dict | None,
+    candidates: list[dict],
+    tracker: TokenTracker | None = None,
+) -> tuple[int | None, str]:
+    """LLM tie-breaker: choose one candidate, never rewrite SQL."""
+    lines: list[str] = []
+    for idx, cand in enumerate(candidates):
+        issues = cand.get("checker_issues") or []
+        issue_text = json.dumps(
+            [
+                {"code": getattr(x, "code", None) or x.get("code", ""), "message": getattr(x, "message", None) or x.get("message", "")}
+                if isinstance(x, dict)
+                else {"code": getattr(x, "code", ""), "message": getattr(x, "message", "")}
+                for x in issues
+            ],
+            ensure_ascii=False,
+        )
+        lines.append(
+            f"候选 {idx}\n"
+            f"type={cand.get('type', '')}, variant={cand.get('variant_id', '')}\n"
+            f"SQL:\n{cand.get('sql', '')}\n"
+            f"执行结果预览:\n{_format_sql_result(cand.get('result'), limit=3)}\n"
+            f"checker issues: {issue_text}\n"
+        )
+    prompt = (
+        "你是 SQL 候选仲裁器。只能从候选中选择最能回答用户问题的一条 SQL，禁止改写或新增 SQL。\n"
+        "选择标准：优先忠实使用用户原问题条件、SELECT 目标能回答问题、结果非空且不过度约束。\n\n"
+        f"[用户问题]\n{question}\n\n"
+        f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
+        f"[候选]\n{chr(10).join(lines)}\n"
+        "只输出 JSON：{\"best_index\": 0, \"原因\": \"...\"}\n"
+    )
+    extra_body: dict = {}
+    if getattr(settings, "evidence_use_guided_json", False):
+        extra_body["guided_json"] = _CHOICE_SCHEMA
+    if not getattr(settings, "enable_thinking_for_entity", True):
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=256,
+            timeout=settings.llm_request_timeout_sec,
+            extra_body=extra_body or None,
+        )
+        if tracker:
+            tracker.track(resp)
+        idx, reason = parse_choice_response(resp.choices[0].message.content or "")
+        if idx is None or idx < 0 or idx >= len(candidates):
+            return None, reason
+        return idx, reason
+    except Exception as exc:
+        debug_print(f"[ConsistencyJudge][choice] skipped: {type(exc).__name__}: {exc}")
+        return None, ""

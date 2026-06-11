@@ -121,20 +121,20 @@ def build_plan_markdown(
     *,
     include_evidence: bool = False,
 ) -> str:
-    """把富 schema 表 + Must-have 必须列（可选证据列）合并为单一 markdown。"""
+    """把富 schema 表 + 参考证据列合并为单一 markdown。"""
     must = [str(c).strip() for c in (must_have or []) if str(c).strip()]
     must = list(dict.fromkeys(must))
 
     parts = [schema_markdown.rstrip()]
 
-    parts.append("\n### Must-have（必须包含的列）")
+    parts.append("\n### 参考证据列（不强制使用）")
     if must:
         parts.extend(f"- {col}" for col in must)
     else:
         parts.append("-（无）")
 
     if include_evidence:
-        parts.append("\n### 证据列（实体对齐）")
+        parts.append("\n### 实体对齐证据（不强制使用）")
         evidence_md = build_evidence_markdown(evidence)
         parts.append(evidence_md if evidence_md else "-（无）")
 

@@ -98,7 +98,7 @@ class Settings:
     lsh_num_perm: int = 64
     lsh_query_jaccard_threshold: float = 0.78
     lsh_query_seq_ratio: float = 0.84
-    lsh_query_combined_threshold: float = 0.72
+    lsh_query_combined_threshold: float = 0.8
     c_secondary_seq_ratio: float = 0.82
     c_secondary_jaccard: float = 0.55
     c_secondary_seq_with_jac: float = 0.62
@@ -108,7 +108,7 @@ class Settings:
     lsh_query_seq_with_jac: float = 0.67
     lsh_query_cover: float = 0.58
     semantic_value_top_k: int = 5
-    semantic_value_threshold: float = 0.62
+    semantic_value_threshold: float = 0.8
     semantic_value_max_values_per_column: int = 200
     enable_semantic_value_retrieval: bool = field(
         default_factory=lambda: os.getenv("ENABLE_SEMANTIC_VALUE_RETRIEVAL", "True").lower() == "true"
@@ -144,6 +144,15 @@ class Settings:
     direct_temperature: float = 0.3
     max_gen_tokens: int = field(
         default_factory=lambda: int(os.getenv("LLM_MAX_GEN_TOKENS", "1024"))
+    )
+    generator_candidates_per_route: int = field(
+        default_factory=lambda: int(os.getenv("GEN_CANDIDATES_PER_ROUTE", "2"))
+    )
+    intent_plan_max_tokens: int = field(
+        default_factory=lambda: int(os.getenv("INTENT_PLAN_MAX_TOKENS", "512"))
+    )
+    intent_plan_use_guided_json: bool = field(
+        default_factory=lambda: os.getenv("INTENT_PLAN_USE_GUIDED_JSON", "True").lower() == "true"
     )
     llm_request_timeout_sec: int = field(
         default_factory=lambda: int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "180"))

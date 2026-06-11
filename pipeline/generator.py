@@ -7,6 +7,7 @@ from openai import AsyncOpenAI, APIConnectionError
 
 from config.settings import settings
 from pipeline.fewshot_index import FewShotFaissStore
+from pipeline.intent_planner import IntentPlanner
 from pipeline.schema_format import build_light_schema_markdown, enrich_schema_columns
 from pipeline.utils import TokenTracker, debug_print
 
@@ -23,43 +24,35 @@ class SQLGenerator:
         self._ensure_fewshot_index_ready()
 
     def _ensure_fewshot_index_ready(self) -> None:
-        """启动自检：缺少 few-shot 索引时按配置自动构建。"""
         index_exists = self.fewshot_store.index_path.exists()
         meta_exists = self.fewshot_store.meta_path.exists()
         if index_exists and meta_exists:
             return
-
         if not settings.fewshot_autobuild_on_start:
-            debug_print(
-                "[Generator][fewshot] 索引缺失且已关闭自动构建，"
-                f"请先执行离线构建: {self.fewshot_store.index_dir}"
-            )
+            debug_print(f"[Generator][fewshot] index missing: {self.fewshot_store.index_dir}")
             return
-
         try:
-            debug_print("[Generator][fewshot] 检测到索引缺失，开始自动构建...")
+            debug_print("[Generator][fewshot] building index...")
             self.fewshot_store.build_offline_index()
-            debug_print("[Generator][fewshot] 自动构建完成")
-        except Exception as e:
-            debug_print(f"[Generator][fewshot] 自动构建失败，将降级为空召回: {type(e).__name__}: {e}")
+        except Exception as exc:
+            debug_print(f"[Generator][fewshot] build skipped: {type(exc).__name__}: {exc}")
 
     @staticmethod
     def extract_sql(text: str) -> str:
         if not text:
             return ""
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        m = re.search(r"```sql\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r"```\s*(.*?)\s*```", text, flags=re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r"(SELECT\s+.*)", text, flags=re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else text.strip()
+        match = re.search(r"```sql\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r"```\s*(.*?)\s*```", text, flags=re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r"(SELECT\s+.*)", text, flags=re.DOTALL | re.IGNORECASE)
+        return match.group(1).strip() if match else text.strip()
 
     @staticmethod
     def highlight_question_for_prompt(question: str) -> str:
-        """在 prompt 中加粗问题全文，提醒模型以问题原文为字面量来源。"""
         text = str(question or "").strip()
         return f"**{text}**" if text else ""
 
@@ -68,10 +61,10 @@ class SQLGenerator:
         return (
             "要求：\n"
             "1. 不要重新做 schema linking。\n"
-            "2. WHERE/HAVING 中的编码、单号、名称等过滤值必须来自【用户问题】原文，"
-            "**严禁使用 Schema 示例值、枚举值或范围中的数字替代问题字面量**。\n"
-            "3. 业务编码/单号列（如物料编码、采购订单号）请用带引号的文本字面量，例如 `\"物料编码\" = '500138627'`。\n"
-            "4. 结果行如存在多条重复值，请优先考虑使用 DISTINCT 去重。\n"
+            "2. WHERE/HAVING 中的编码、单号、名称等过滤值必须来自用户问题原文，"
+            "严禁使用 Schema 示例值、枚举值或范围值替代问题字面量。\n"
+            "3. 业务编码/单号列请优先使用带引号的文本字面量，例如 `\"物料编码\" = '500138627'`。\n"
+            "4. 结果存在重复值时，优先考虑 DISTINCT。\n"
             "5. 只输出 SQL，用 ```sql 包裹。\n"
         )
 
@@ -86,6 +79,7 @@ class SQLGenerator:
         cols = list(selected_columns)
         if randomize:
             import random
+
             random.shuffle(cols)
         enriched = enrich_schema_columns(cols, all_metadata or [], profile_detail_map)
         return build_light_schema_markdown(enriched, table_name)
@@ -96,6 +90,9 @@ class SQLGenerator:
         tracker: TokenTracker,
         temperature: float,
         path_type: str,
+        *,
+        variant_id: int = 1,
+        prompt_variant: str = "",
     ) -> dict | None:
         try:
             extra_body: dict = {"chat_template_kwargs": {"enable_thinking": False}}
@@ -121,12 +118,18 @@ class SQLGenerator:
             sql = self.extract_sql(content)
             if not sql:
                 return None
-            return {"type": path_type, "sql": sql, "raw_content": content}
-        except APIConnectionError as e:
-            debug_print(f"[Generator][FATAL][{path_type}] LLM 连接失败: {e}")
+            return {
+                "type": path_type,
+                "variant_id": variant_id,
+                "prompt_variant": prompt_variant or path_type,
+                "sql": sql,
+                "raw_content": content,
+            }
+        except APIConnectionError as exc:
+            debug_print(f"[Generator][FATAL][{path_type}] LLM connection failed: {exc}")
             return None
-        except Exception as e:
-            debug_print(f"[Generator][{path_type}] 生成失败: {type(e).__name__}: {e}")
+        except Exception as exc:
+            debug_print(f"[Generator][{path_type}] failed: {type(exc).__name__}: {exc}")
             return None
 
     def _build_fewshot_context(self, question: str) -> str:
@@ -135,89 +138,122 @@ class SQLGenerator:
                 query=question,
                 top_k=settings.icl_few_shot_k,
             )
-        except Exception as e:
-            debug_print(f"[Generator][fewshot] 召回失败，降级为空: {type(e).__name__}: {e}")
+        except Exception as exc:
+            debug_print(f"[Generator][fewshot] recall skipped: {type(exc).__name__}: {exc}")
             return ""
+
+    def build_generation_prompt_specs(
+        self,
+        question: str,
+        schema_prompt: str,
+        intent_plan: dict | None = None,
+    ) -> list[dict]:
+        query_signature = IntentPlanner.build_query_signature(intent_plan)
+        fewshot_context = self._build_fewshot_context(question)
+        if fewshot_context and query_signature:
+            fewshot_context = f"[Query Signature]\n{query_signature}\n\n{fewshot_context}"
+        fewshot_block = f"[Few-shot示例]\n{fewshot_context}\n\n" if fewshot_context else ""
+        intent_block = IntentPlanner.to_prompt_block(intent_plan)
+        intent_section = f"[弱意图解析]\n{intent_block}\n\n" if intent_block else ""
+        highlighted_question = self.highlight_question_for_prompt(question)
+        diversity_rule = (
+            "多候选要求：每条 SQL 必须对应用户问题中的明确查询意图；可以在 SELECT、DISTINCT、"
+            "聚合或宽松匹配方式上做合理差异，但不得为了覆盖候选字段而遍历生成无问题依据的 SELECT/WHERE。"
+        )
+        base_prompt = (
+            "你是一名 SQL 专家。请只基于给定 Schema 生成 SQLite SQL。\n\n"
+            + fewshot_block
+            + intent_section
+            + f"[Schema]\n{schema_prompt}\n"
+            + f"[用户问题]\n{highlighted_question}\n"
+            + self._sql_generation_rules()
+            + diversity_rule
+            + "\n只输出一条 SQL，并用 ```sql 包裹。\n"
+        )
+        route_prompts = {
+            "direct": [
+                "直接根据 Schema 和问题原文生成最简 SQL。",
+                "在保持问题条件不变的前提下，生成一个更稳健的等价 SQL，优先考虑 DISTINCT 或必要的非空过滤。",
+            ],
+            "icl": [
+                "参考 Few-shot 和字段语义生成 SQL，过滤值必须逐字来自用户问题原文。",
+                "参考相似查询结构生成 SQL，不得借用示例值或枚举值作为过滤条件。",
+            ],
+            "plan": [
+                "先在心中规划 SELECT、WHERE、聚合和排序，再输出唯一 SQL。",
+                "优先检查用户到底要返回描述值、编码值还是统计值，再输出唯一 SQL。",
+            ],
+            "intent_plan": [
+                "优先参考弱意图解析，但它不是硬约束；如有冲突，以用户问题原文为准。",
+                "结合弱意图解析中的风险提示生成 SQL，避免替换用户原文条件。",
+            ],
+        }
+        per_route = max(1, int(getattr(settings, "generator_candidates_per_route", 2)))
+        specs: list[dict] = []
+        for route, hints in route_prompts.items():
+            for idx, hint in enumerate(hints[:per_route], start=1):
+                specs.append(
+                    {
+                        "type": route,
+                        "variant_id": idx,
+                        "prompt_variant": hint,
+                        "prompt": base_prompt + f"\n[路径提示:{route}-{idx}] {hint}\n",
+                    }
+                )
+        return specs
 
     async def generate_from_plan_async(
         self,
         question: str,
         schema_prompt: str,
         tracker: TokenTracker,
+        intent_plan: dict | None = None,
     ) -> dict | None:
-        fewshot_context = self._build_fewshot_context(question)
-        fewshot_block = f"[Few-shot示例]\n{fewshot_context}\n\n" if fewshot_context else ""
-        highlighted_question = self.highlight_question_for_prompt(question)
-
-        base_prompt = (
-            "你是一名SQL专家。请只基于给定的 Schema 生成一条 SQLite SQL。\n\n"
-            + fewshot_block
-            + f"[Schema]\n{schema_prompt}\n"
-            + f"[用户问题]\n{highlighted_question}\n"
-            + self._sql_generation_rules()
+        candidates = await self.generate_candidates_async(
+            question,
+            schema_prompt,
+            tracker,
+            intent_plan=intent_plan,
         )
-
-        prompt_direct = base_prompt + "\n[路径提示] 直接根据 Schema 与加粗问题原文生成最简洁 SQL。"
-        prompt_icl = base_prompt + "\n[路径提示] 参考字段语义，过滤条件必须逐字来自加粗问题原文。"
-        prompt_plan = base_prompt + (
-            "\n[路径提示] 在生成最终 SQL 前，必须先给出结构化 Plan，再给出唯一 SQL。\n"
-            "在生成最终的 SQL 之前，请严格按照以下 4 个步骤输出你的规划分析（Plan）：\n\n"
-            "<Plan>\n"
-            "1. 【核心意图】：用户到底想查什么？（例如：求和、计数、最值、条件罗列、比例推算？）\n"
-            "2. 【列与实体映射】：\n"
-            "   - SELECT 目标列：___\n"
-            "   - WHERE 条件列：___ (过滤值必须来自加粗问题原文，禁止使用 Schema 示例值)\n"
-            "   - GROUP BY/ORDER BY 列 (如果需要)：___\n"
-            "3. 【逻辑陷阱排查】：\n"
-            "   - 是否需要过滤空值 (IS NOT NULL)？\n"
-            "   - 是否需要去重 (DISTINCT)？\n"
-            "   - 排序时是升序 (ASC) 还是降序 (DESC)？\n"
-            "4. 【草稿组装】：简述 SQL 各个子句的连接逻辑。\n"
-            "</Plan>\n\n"
-            "[最终生成]\n"
-            "请基于上述 Plan，输出唯一可执行的 SQLite SQL。"
-        )
-
-        tasks = [
-            asyncio.create_task(self._call_llm_sql(prompt_direct, tracker, settings.direct_temperature, "direct")),
-            asyncio.create_task(self._call_llm_sql(prompt_icl, tracker, settings.icl_temperature, "icl")),
-            asyncio.create_task(self._call_llm_sql(prompt_plan, tracker, settings.direct_temperature, "plan")),
-        ]
-        results = await asyncio.gather(*tasks)
-        valid = [r for r in results if r and r.get("sql")]
-        if not valid:
-            return None
-        return valid[0]
+        return candidates[0] if candidates else None
 
     async def start_candidate_tasks(
         self,
         question: str,
         schema_prompt: str,
         tracker: TokenTracker,
+        intent_plan: dict | None = None,
     ) -> list[asyncio.Task]:
-        fewshot_context = self._build_fewshot_context(question)
-        fewshot_block = f"[Few-shot示例]\n{fewshot_context}\n\n" if fewshot_context else ""
-
-        highlighted_question = self.highlight_question_for_prompt(question)
-        base_prompt = (
-            "你是一名SQL专家。请只基于给定的 Schema 生成一条 SQLite SQL。\n\n"
-            + fewshot_block
-            + f"[Schema]\n{schema_prompt}\n"
-            + f"[用户问题]\n{highlighted_question}\n"
-            + self._sql_generation_rules()
-        )
-        return [
-            asyncio.create_task(self._call_llm_sql(base_prompt + "\n[路径提示] direct", tracker, settings.direct_temperature, "direct")),
-            asyncio.create_task(self._call_llm_sql(base_prompt + "\n[路径提示] icl", tracker, settings.icl_temperature, "icl")),
-            asyncio.create_task(self._call_llm_sql(base_prompt + "\n[路径提示] plan", tracker, settings.direct_temperature, "plan")),
-        ]
+        specs = self.build_generation_prompt_specs(question, schema_prompt, intent_plan=intent_plan)
+        tasks: list[asyncio.Task] = []
+        for spec in specs:
+            temperature = settings.icl_temperature if spec["type"] == "icl" else settings.direct_temperature
+            tasks.append(
+                asyncio.create_task(
+                    self._call_llm_sql(
+                        spec["prompt"],
+                        tracker,
+                        temperature,
+                        spec["type"],
+                        variant_id=spec["variant_id"],
+                        prompt_variant=spec["prompt_variant"],
+                    )
+                )
+            )
+        return tasks
 
     async def generate_candidates_async(
         self,
         question: str,
         schema_prompt: str,
         tracker: TokenTracker,
+        intent_plan: dict | None = None,
     ) -> list[dict]:
-        tasks = await self.start_candidate_tasks(question, schema_prompt, tracker)
+        tasks = await self.start_candidate_tasks(
+            question,
+            schema_prompt,
+            tracker,
+            intent_plan=intent_plan,
+        )
         results = await asyncio.gather(*tasks)
         return [r for r in results if r and r.get("sql")]

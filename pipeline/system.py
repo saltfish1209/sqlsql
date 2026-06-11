@@ -11,13 +11,14 @@ from pipeline.db_engine import DBEngine
 from pipeline.schema_linker import SchemaLinker
 from pipeline.entity_extractor import EntityExtractor
 from pipeline.generator import SQLGenerator
+from pipeline.intent_planner import IntentPlanner
 from pipeline.llm_client import create_async_client, get_model_name
 from pipeline.profiler import DatabaseProfiler, apply_instance_fields
 from pipeline.question_splitter import QuestionSplitter
 from pipeline.refiner import SQLRefiner
 from pipeline.selector import SQLSelector
 from pipeline.schema_format import build_light_schema_markdown, build_plan_markdown, enrich_schema_columns
-from pipeline.sql_consistency_judge import judge_sql_consistency
+from pipeline.sql_consistency_judge import choose_sql_candidate, judge_sql_consistency
 from pipeline.utils import TokenTracker, debug_print, to_halfwidth
 
 
@@ -41,6 +42,7 @@ class TextToSQLSystem:
                 f"高空值={len(deprecated.get('high_null_ratio', []))}"
             )
         self.entity_extractor = EntityExtractor(self.client, self.llm_model)
+        self.intent_planner = IntentPlanner(self.client, self.llm_model)
         self.generator = SQLGenerator(self.client, self.llm_model)
         self.splitter = QuestionSplitter(self.client, self.llm_model)
         self.refiner = SQLRefiner(self.client, self.llm_model, self.db_engine)
@@ -69,11 +71,15 @@ class TextToSQLSystem:
         final_schema = stages["final_schema"]
         schema_prompt = stages["schema_prompt"]
         repair_schema_prompt = stages["repair_schema_prompt"]
+        intent_plan = stages.get("intent_plan") or {}
 
-        cand = await self.generator.generate_from_plan_async(
-            question, schema_prompt, tracker
+        candidates = await self.generator.generate_candidates_async(
+            question,
+            schema_prompt,
+            tracker,
+            intent_plan=intent_plan,
         )
-        if cand is None:
+        if not candidates:
             return {
                 "final_sql": None,
                 "execution_result": None,
@@ -83,19 +89,41 @@ class TextToSQLSystem:
                 "entities": entities,
                 "candidate_schema_pack": plan_schema,
                 "sql_generation_spec": schema_prompt,
+                "intent_plan": intent_plan,
                 "is_multi_question": False,
             }
 
-        cand["confidence"] = float(candidate_pack.Top20候选[0]["相关性分数"]) if candidate_pack.Top20候选 else 0.0
+        confidence = float(candidate_pack.Top20候选[0]["相关性分数"]) if candidate_pack.Top20候选 else 0.0
+        for cand in candidates:
+            cand["confidence"] = confidence
         cliff_schema_prompt = stages.get("cliff_schema_prompt") or schema_prompt
         refined = await self.refiner.refine_async(
             schema_prompt,
-            [cand],
+            candidates,
             candidate_pack.Top20候选,
             tracker,
             repair_schema_prompt=repair_schema_prompt,
         )
         selected, reason, status = self.selector.select_best(question, schema_prompt, refined)
+        scored = self.selector.score_candidates(refined)
+        if (
+            status == "success"
+            and settings.enable_sql_consistency_judge
+            and len(scored) >= 2
+            and scored[0]["score"] - scored[1]["score"] <= self.selector.tie_margin
+        ):
+            tie_candidates = [item["candidate"] for item in scored[:2]]
+            chosen_idx, choice_reason = await choose_sql_candidate(
+                self.client,
+                self.llm_model,
+                question=question,
+                intent_plan=intent_plan,
+                candidates=tie_candidates,
+                tracker=tracker,
+            )
+            if chosen_idx is not None:
+                selected = tie_candidates[chosen_idx]
+                reason = f"llm_tiebreak: {choice_reason or chosen_idx}"
         if selected is None:
             return {
                 "final_sql": None,
@@ -106,6 +134,11 @@ class TextToSQLSystem:
                 "entities": entities,
                 "candidate_schema_pack": plan_schema,
                 "sql_generation_spec": schema_prompt,
+                "intent_plan": intent_plan,
+                "candidate_sqls": [
+                    {"type": c.get("type"), "variant_id": c.get("variant_id"), "sql": c.get("sql")}
+                    for c in refined
+                ],
                 "is_multi_question": False,
             }
 
@@ -134,6 +167,7 @@ class TextToSQLSystem:
                 schema_prompt=cliff_schema_prompt,
                 sql=str(selected.get("sql") or ""),
                 result=unique_rows if result else result,
+                intent_plan=intent_plan,
                 tracker=tracker,
             )
             if not consistent:
@@ -173,6 +207,11 @@ class TextToSQLSystem:
             "证据实体": entities,
             "候选字段包": plan_schema,
             "sql_generation_spec": schema_prompt,
+            "intent_plan": intent_plan,
+            "candidate_sqls": [
+                {"type": c.get("type"), "variant_id": c.get("variant_id"), "sql": c.get("sql"), "status": c.get("status")}
+                for c in refined
+            ],
             "repair_schema": final_schema,
             "is_multi_question": False,
         }
@@ -202,12 +241,19 @@ class TextToSQLSystem:
         cliff_schema_prompt = self._build_schema_markdown(cliff_schema)
         schema_prompt = self._build_plan_markdown(candidate_pack, plan_schema)
         repair_schema_prompt = self._build_plan_markdown(candidate_pack, final_schema)
+        intent_plan = await self.intent_planner.plan_async(
+            question,
+            schema_prompt,
+            entities=entities,
+            tracker=tracker,
+        )
         return {
             "question": question,
             "norm_question": norm_question,
             "initial_pack": initial_pack,
             "candidate_pack": candidate_pack,
             "entities": entities,
+            "intent_plan": intent_plan,
             "plan_schema": plan_schema,
             "final_schema": final_schema,
             "cliff_schema": cliff_schema,
@@ -233,7 +279,8 @@ class TextToSQLSystem:
         return build_plan_markdown(
             self._build_schema_markdown(schema_columns),
             candidate_pack.必须列集合,
-            include_evidence=False,
+            candidate_pack.证据详情,
+            include_evidence=True,
         )
 
     async def _maybe_split_question(self, question: str, tracker: TokenTracker | None = None) -> list[str]:
