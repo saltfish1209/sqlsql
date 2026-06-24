@@ -1,0 +1,17 @@
+Create one horizontal animation strip for Codex pet `tv-head-engineer`, state `review`.
+
+Use the attached canonical base for identity. Use the attached layout guide only for slot count, spacing, centering, and padding; do not draw the guide.
+
+Output exactly 6 full-body frames in one left-to-right row on flat pure magenta #FF00FF. Treat the row as 6 invisible equal-width slots: one centered complete pose per slot, evenly spaced, with no overlap, clipping, empty slots, labels, or borders.
+
+Identity: same pet in every frame: Television-head engineer mascot for Codex. Whole-body chibi office engineer with a compact TV head, friendly screen-face shown only with emoji expressions, simple engineer outfit, clean flat-vector cartoon styling, crisp silhouette, readable at small size. Default expression is relaxed smiling emoji. No text on screen. No extra scene elements. No complex background. Orange safety helmet is forbidden in every state except running and failed. Computer is forbidden in every state except running. In running, show a 6-frame mini story: starts debugging, picks up orange helmet, puts it on, then sits on the ground facing a laptop debugging with a focused emoji on screen. In failed, safety helmet is already worn and expression should feel frustrated, worried, sweaty, or discouraged. In running-right and running-left, the character is being dragged by the mouse, lifted up with a startled emoji on the TV screen; right row faces right, left row faces left. In waving, raise one hand in a friendly greeting. In jumping, make a small energetic hop. In waiting, calm patient pose, maybe slight lean or folded arms. In review, lean forward and inspect carefully with a focused emoji. Screen must use emoji emotion only, never words.. Preserve silhouette, face, proportions, markings, palette, material, style, and props.
+Style: Pet-safe sprite: compact full-body mascot, readable in a 192x208 cell, clear silhouette, simple face, stable palette/materials, and crisp edges for chroma-key extraction. Style `flat-vector`: Flat vector-style mascot with simple geometric forms, crisp color areas, clean outline, and minimal shading. User style notes: flat vector cartoon, clean shapes, clear outline hierarchy, tiny-size readable, no background, no scenery, no text, clean mascot animation design.
+Animation continuity: keep apparent pet scale and baseline stable within the row unless the state itself intentionally changes vertical position, such as `jumping`. Move the pose within the slot instead of redrawing the pet larger or smaller frame to frame.
+
+State action: Ready-review loop: focused inspection of completed output with lean, blink, narrowed eyes, head tilt, or paw pose.
+
+State requirements:
+- Show review through lean, blink, narrowed eyes, head tilt, or paw/hand position.
+- Do not add magnifying glasses, papers, code, UI, punctuation, symbols, or other new props unless they already exist in the base pet identity.
+
+Clean extraction: crisp opaque edges, safe padding, no scenery, text, guide marks, checkerboard, shadows, glows, motion blur, speed lines, dust, detached effects, stray pixels, or chroma-key colors inside the pet.

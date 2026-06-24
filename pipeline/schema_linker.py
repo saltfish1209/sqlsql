@@ -589,7 +589,7 @@ class SchemaLinker:
             for c in self.column_metadata
         ]
         debug_print(f"[Schema][A-route] CrossEncoder 输入对数: {len(pairs)}")
-        scores = self.rank_model.predict(pairs)
+        scores = self.rank_model.predict(pairs, show_progress_bar=False)
         for idx, (meta, score) in enumerate(sorted(zip(self.column_metadata, scores), key=lambda x: x[1], reverse=True), start=1):
             col = meta["column_name"]
             prof = self.profile_detail_map.get(col, {})

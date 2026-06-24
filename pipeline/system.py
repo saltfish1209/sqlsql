@@ -289,7 +289,7 @@ class TextToSQLSystem:
         return await self.splitter.split(question, tracker=tracker)
 
     def _assemble_plan_schema(self, candidate_pack) -> list[dict]:
-        """生成/plan 用：精简 schema + 问题中完整出现的列名（must_have）。"""
+        """生成用：精简 schema + 问题中完整出现的列名（must_have）。"""
         compact = list(candidate_pack.精简schema or [])
         must_have = [str(c).strip() for c in (candidate_pack.必须列集合 or []) if str(c).strip()]
         ranked_lookup = {

@@ -13,31 +13,31 @@ from pipeline.utils import TokenTracker, debug_print
 _INTENT_SCHEMA = {
     "type": "object",
     "properties": {
-        "查询目标": {"type": "string"},
-        "筛选条件": {
+        "query_target": {"type": "string"},
+        "filters": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "条件文本": {"type": "string"},
-                    "含义": {"type": "string"},
-                    "建议匹配方式": {"type": "string"},
+                    "text": {"type": "string"},
+                    "meaning": {"type": "string"},
+                    "match": {"type": "string"},
                 },
-                "required": ["条件文本", "含义", "建议匹配方式"],
+                "required": ["text", "meaning", "match"],
             },
         },
-        "计算条件": {
+        "calculation": {
             "type": "object",
             "properties": {
-                "聚合": {"type": "string"},
-                "排序": {"type": "string"},
+                "aggregation": {"type": "string"},
+                "order": {"type": "string"},
                 "top_k": {},
             },
-            "required": ["聚合", "排序", "top_k"],
+            "required": ["aggregation", "order", "top_k"],
         },
-        "风险提示": {"type": "array", "items": {"type": "string"}},
+        "risk_notes": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["查询目标", "筛选条件", "计算条件", "风险提示"],
+    "required": ["query_target", "filters", "calculation", "risk_notes"],
 }
 
 
@@ -45,10 +45,10 @@ class IntentPlanner:
     """Builds a weak, non-binding intent sketch for SQL generation."""
 
     DEFAULT_PLAN = {
-        "查询目标": "",
-        "筛选条件": [],
-        "计算条件": {"聚合": "none", "排序": "none", "top_k": None},
-        "风险提示": [],
+        "query_target": "",
+        "filters": [],
+        "calculation": {"aggregation": "none", "order": "none", "top_k": None},
+        "risk_notes": [],
     }
 
     def __init__(self, client: AsyncOpenAI, model: str):
@@ -59,18 +59,35 @@ class IntentPlanner:
     def normalize_plan(cls, value: Any) -> dict:
         if not isinstance(value, dict):
             return dict(cls.DEFAULT_PLAN)
-        calc = value.get("计算条件") if isinstance(value.get("计算条件"), dict) else {}
-        filters = value.get("筛选条件") if isinstance(value.get("筛选条件"), list) else []
-        risks = value.get("风险提示") if isinstance(value.get("风险提示"), list) else []
+        calc = value.get("calculation") or value.get("计算条件")
+        if not isinstance(calc, dict):
+            calc = {}
+        filters = value.get("filters") or value.get("筛选条件")
+        if not isinstance(filters, list):
+            filters = []
+        risks = value.get("risk_notes") or value.get("风险提示")
+        if not isinstance(risks, list):
+            risks = []
+        normalized_filters = []
+        for item in filters:
+            if not isinstance(item, dict):
+                continue
+            normalized_filters.append(
+                {
+                    "text": str(item.get("text") or item.get("条件文本") or "").strip(),
+                    "meaning": str(item.get("meaning") or item.get("含义") or "").strip(),
+                    "match": str(item.get("match") or item.get("建议匹配方式") or "").strip(),
+                }
+            )
         return {
-            "查询目标": str(value.get("查询目标") or "").strip(),
-            "筛选条件": [x for x in filters if isinstance(x, dict)],
-            "计算条件": {
-                "聚合": str(calc.get("聚合") or "none").strip() or "none",
-                "排序": str(calc.get("排序") or "none").strip() or "none",
+            "query_target": str(value.get("query_target") or value.get("查询目标") or "").strip(),
+            "filters": normalized_filters,
+            "calculation": {
+                "aggregation": str(calc.get("aggregation") or calc.get("聚合") or "none").strip() or "none",
+                "order": str(calc.get("order") or calc.get("排序") or "none").strip() or "none",
                 "top_k": calc.get("top_k"),
             },
-            "风险提示": [str(x).strip() for x in risks if str(x).strip()],
+            "risk_notes": [str(x).strip() for x in risks if str(x).strip()],
         }
 
     @classmethod
@@ -96,16 +113,16 @@ class IntentPlanner:
     @staticmethod
     def build_query_signature(intent_plan: dict | None) -> str:
         plan = IntentPlanner.normalize_plan(intent_plan)
-        calc = plan.get("计算条件") or {}
+        calc = plan.get("calculation") or {}
         filter_types = [
-            str(item.get("含义") or item.get("条件文本") or "").strip()
-            for item in plan.get("筛选条件", [])
+            str(item.get("meaning") or item.get("text") or "").strip()
+            for item in plan.get("filters", [])
             if isinstance(item, dict)
         ]
         parts = [
-            f"target={plan.get('查询目标') or 'unknown'}",
-            f"agg={calc.get('聚合') or 'none'}",
-            f"order={calc.get('排序') or 'none'}",
+            f"target={plan.get('query_target') or 'unknown'}",
+            f"agg={calc.get('aggregation') or 'none'}",
+            f"order={calc.get('order') or 'none'}",
             "filters=" + ",".join([x for x in filter_types if x]),
         ]
         return " | ".join(parts)
@@ -120,15 +137,16 @@ class IntentPlanner:
     ) -> dict:
         entity_text = json.dumps(entities or [], ensure_ascii=False)
         prompt = (
-            "你是一个 Text-to-SQL 弱意图解析器。请只输出 JSON，不要生成 SQL。\n"
-            "该意图只作为参考，不是硬约束；如果不确定可以留空或写 none。\n"
-            "筛选条件必须来自用户问题原文，不得使用 Schema 示例值替代。\n\n"
-            f"[Schema]\n{schema_prompt}\n\n"
-            f"[实体参考]\n{entity_text}\n\n"
-            f"[用户问题]\n{question}\n\n"
-            "输出格式：\n"
-            '{"查询目标":"", "筛选条件":[{"条件文本":"","含义":"","建议匹配方式":"="}], '
-            '"计算条件":{"聚合":"none","排序":"none","top_k":null}, "风险提示":[]}'
+            "# Role\n你是一个 Text-to-SQL 弱意图解析器。请只输出 JSON，不要生成 SQL。\n\n"
+            "## 约束\n"
+            "- 该意图只作为参考，不是硬约束；如果不确定可以留空或写 none。\n"
+            "- 筛选条件必须来自用户问题原文，不得使用 Schema 示例值替代。\n\n"
+            f"## Schema\n{schema_prompt}\n\n"
+            f"## 实体参考\n{entity_text}\n\n"
+            f"## 用户问题\n{question}\n\n"
+            "## 输出格式\n"
+            '{"query_target":"", "filters":[{"text":"","meaning":"","match":"="}], '
+            '"calculation":{"aggregation":"none","order":"none","top_k":null}, "risk_notes":[]}'
         )
         extra_body: dict = {}
         if getattr(settings, "intent_plan_use_guided_json", True):

@@ -121,7 +121,7 @@ class FewShotFaissStore:
             texts,
             convert_to_numpy=True,
             normalize_embeddings=self.normalize_embeddings,
-            show_progress_bar=True,
+            show_progress_bar=False,
         )
         return emb.astype(np.float32)
 

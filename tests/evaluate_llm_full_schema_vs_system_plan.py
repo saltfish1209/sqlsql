@@ -46,9 +46,10 @@ ABLATION_CONFIGS = [
     ("主系统+topk截断schema", "main_topk_schema", "main_topk_schema_recall"),
     ("主系统+direct单路径", "main_direct_only", "main_direct_only_recall"),
     ("主系统+icl单路径", "main_icl_only", "main_icl_only_recall"),
+    ("主系统+intent_plan单路径", "main_intent_plan_only", "main_intent_plan_only_recall"),
     ("主系统(无refiner)", "main_no_refiner", "main_no_refiner_schema_recall"),
     ("主系统(无实体提取)", "main_no_entity", "main_no_entity_schema_recall"),
-    ("主系统(无consistency judge)", "main_no_judge", "main_no_judge_recall"),
+    ("主系统(无审查judge, refiner+一致性投票)", "main_no_judge", "main_no_judge_recall"),
 ]
 
 
@@ -294,7 +295,7 @@ def _build_summary_rows(
                 "正确题数(总题数)": f"{correct}({total})",
                 "花费时间": _avg(rows, f"{prefix}_time_seconds"),
                 "tokens平均消耗": _avg(rows, f"{prefix}_total_tokens"),
-                "构建schema表时recall": _avg(rows, recall_key),
+                "recall": _avg(rows, recall_key),
             }
         )
     return summary
@@ -306,6 +307,51 @@ def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _read_csv_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _append_csv_row(path: Path, row: dict, fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _append_jsonl_rows(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+def _completed_labels(path: Path) -> set[str]:
+    name_key = SUMMARY_FIELDNAMES[0]
+    return {
+        str(row.get(name_key) or "").strip()
+        for row in _read_csv_rows(path)
+        if str(row.get(name_key) or "").strip()
+    }
+
+
+def _print_resume_state(group_label: str, path: Path, configs: list[tuple[str, str, str]]) -> None:
+    completed = _completed_labels(path)
+    labels = [label for label, _prefix, _recall_key in configs]
+    done = [label for label in labels if label in completed]
+    pending = [label for label in labels if label not in completed]
+    print(f"[Resume][{group_label}] CSV: {path}")
+    print(f"[Resume][{group_label}] completed {len(done)}/{len(labels)}: {done or 'None'}")
+    print(f"[Resume][{group_label}] pending: {pending or 'None'}")
 
 
 def _record_metrics(
@@ -392,13 +438,10 @@ def _prepare_topk_eval_stages(system, question: str) -> dict:
     }
 
 
-async def _run_full_schema_once(system, question: str, schema_prompt: str) -> dict:
-    from pipeline.generator import SQLGenerator
-
-    start = time.time()
-    tracker = TokenTracker()
+def _build_plain_schema_sql_prompt(question: str, schema_prompt: str) -> str:
+    """公平对比版：仅保留 schema markdown 与单次 SQL 生成提示。"""
     question = to_halfwidth(question)
-    prompt = (
+    return (
         "你是一名SQL专家。请根据Schema为下列问题生成一条 SQLite SQL 查询。\n"
         "采用 sqlite，不需要加上数据库名，直接使用对应表名即可。\n\n"
         "以问题信息为生成SQL主要条件，Schema提供辅助。\n"
@@ -410,6 +453,14 @@ async def _run_full_schema_once(system, question: str, schema_prompt: str) -> di
         "2. 列名使用双引号包裹，如 `\"列名\"`。\n"
         "请直接输出SQL，用```sql ... ```包裹，不需要解释或其他内容。\n"
     )
+
+
+async def _run_full_schema_once(system, question: str, schema_prompt: str) -> dict:
+    from pipeline.generator import SQLGenerator
+
+    start = time.time()
+    tracker = TokenTracker()
+    prompt = _build_plain_schema_sql_prompt(question, schema_prompt)
     sql = ""
     reason = "success"
     try:
@@ -520,13 +571,13 @@ async def _run_linked_schema_from_stages(system, stages: dict) -> dict:
 async def _run_cliff_schema_once(system, question: str, *, stages: dict | None = None) -> dict:
     if stages is None:
         stages = _prepare_cliff_eval_stages(system, question)
-    return await _run_linked_schema_from_stages(system, stages)
+    return await _run_full_schema_once(system, stages["question"], stages["schema_prompt"])
 
 
 async def _run_topk_schema_once(system, question: str, *, stages: dict | None = None) -> dict:
     if stages is None:
         stages = _prepare_topk_eval_stages(system, question)
-    return await _run_linked_schema_from_stages(system, stages)
+    return await _run_full_schema_once(system, stages["question"], stages["schema_prompt"])
 
 
 def _prepare_main_no_entity_stages(system, question: str) -> dict:
@@ -713,14 +764,19 @@ async def _generate_single_path_cand(
     schema_prompt: str,
     tracker: TokenTracker,
     path_type: str,
+    *,
+    intent_plan: dict | None = None,
 ) -> dict | None:
     gen = system.generator
     fewshot_context = gen._build_fewshot_context(question)
     fewshot_block = f"[Few-shot示例]\n{fewshot_context}\n\n" if fewshot_context else ""
+    intent_block = system.intent_planner.to_prompt_block(intent_plan)
+    intent_section = f"[弱意图解析]\n{intent_block}\n\n" if intent_block else ""
     highlighted_question = gen.highlight_question_for_prompt(question)
     base_prompt = (
         "你是一名SQL专家。请只基于给定的 Schema 生成一条 SQLite SQL。\n\n"
         + fewshot_block
+        + (intent_section if path_type == "intent_plan" else "")
         + f"[Schema]\n{schema_prompt}\n"
         + f"[用户问题]\n{highlighted_question}\n"
         + gen._sql_generation_rules()
@@ -731,6 +787,9 @@ async def _generate_single_path_cand(
     elif path_type == "icl":
         prompt = base_prompt + "\n[路径提示] 参考字段语义，过滤条件必须逐字来自加粗问题原文。"
         temperature = settings.icl_temperature
+    elif path_type == "intent_plan":
+        prompt = base_prompt + "\n[路径提示] 优先参考弱意图解析，但它不是硬约束；如果有冲突，以用户问题原文为准。"
+        temperature = settings.direct_temperature
     else:
         raise ValueError(f"unsupported path_type: {path_type}")
     return await gen._call_llm_sql(prompt, tracker, temperature, path_type)
@@ -942,6 +1001,7 @@ async def _run_main_single_path_once(
         schema_prompt,
         tracker,
         path_type,
+        intent_plan=stages.get("intent_plan"),
     )
     return await _finalize_main_pipeline(
         system,
@@ -958,7 +1018,7 @@ async def _run_main_single_path_once(
 
 
 async def _run_main_no_judge_once(system, question: str, *, stages: dict | None = None) -> dict:
-    """完整主系统，但跳过 consistency judge。"""
+    """完整主系统，但跳过 LLM consistency judge，保留 refiner + selector 一致性投票。"""
     start = time.time()
     tracker = TokenTracker()
     if stages is None:
@@ -996,6 +1056,37 @@ def _compare_output(raw_gt: Any, output: dict) -> tuple[bool, str]:
     pred_parsed = normalize_execution_result(output.get("execution_result"))
     ok, _score, match_type = _compare_results(gt_parsed, pred_parsed)
     return bool(ok), str(match_type)
+
+
+def _build_main_system_detail_record(
+    *,
+    idx: int,
+    question: str,
+    raw_gt: Any,
+    output: dict,
+) -> dict:
+    from training.evaluate import normalize_execution_result, parse_ground_truth
+
+    ok, match_type = _compare_output(raw_gt, output)
+    stages = output.get("stages") or {}
+    return {
+        "idx": idx,
+        "question": question,
+        "ground_truth_raw": raw_gt,
+        "ground_truth_parsed": parse_ground_truth(raw_gt),
+        "final_sql": output.get("final_sql"),
+        "final_result": output.get("execution_result"),
+        "final_result_parsed": normalize_execution_result(output.get("execution_result")),
+        "correct": ok,
+        "match_type": match_type,
+        "reason": output.get("reason"),
+        "cost_time": output.get("cost_time"),
+        "token_usage": output.get("token_usage") or {},
+        "candidate_sqls": output.get("candidate_sqls") or [],
+        "intent_plan": output.get("intent_plan") or stages.get("intent_plan") or {},
+        "plan_schema": stages.get("plan_schema") or [],
+        "repair_schema": output.get("repair_schema") or stages.get("final_schema") or [],
+    }
 
 
 async def _run_schema_compare_one(
@@ -1092,6 +1183,7 @@ async def _run_ablation_one(
         main_topk_output,
         main_direct_output,
         main_icl_output,
+        main_intent_plan_output,
         main_no_refiner_output,
         main_no_entity_output,
         main_no_judge_output,
@@ -1113,6 +1205,7 @@ async def _run_ablation_one(
             ),
             lambda: _run_main_single_path_once(system, question, "direct", stages=main_stages),
             lambda: _run_main_single_path_once(system, question, "icl", stages=main_stages),
+            lambda: _run_main_single_path_once(system, question, "intent_plan", stages=main_stages),
             lambda: _run_main_no_refiner_once(system, question, stages=main_stages),
             lambda: _run_main_no_entity_once(system, question),
             lambda: _run_main_no_judge_once(system, question, stages=main_stages),
@@ -1157,6 +1250,15 @@ async def _run_ablation_one(
     )
     metrics.update(
         _record_metrics(
+            main_intent_plan_output,
+            prefix="main_intent_plan_only",
+            raw_gt=raw_gt,
+            recall_schema=main_stages.get("plan_schema") or [],
+            gold_columns=gold_columns,
+        )
+    )
+    metrics.update(
+        _record_metrics(
             main_no_refiner_output,
             prefix="main_no_refiner",
             raw_gt=raw_gt,
@@ -1184,6 +1286,145 @@ async def _run_ablation_one(
             gold_columns=gold_columns,
         )
     )
+    return metrics
+
+
+def _normalize_recall_key(metrics: dict, prefix: str, recall_key: str) -> None:
+    raw_key = f"{prefix}_recall"
+    if recall_key != raw_key and raw_key in metrics:
+        metrics[recall_key] = metrics.pop(raw_key)
+
+
+async def _run_schema_compare_config_one(
+    *,
+    system,
+    row: dict,
+    idx: int,
+    full_schema_prompt: str,
+    config: tuple[str, str, str],
+) -> dict:
+    _label, prefix, recall_key = config
+    question = str(row.get("生成问题") or "").strip()
+    raw_gt = row.get("生成结果")
+    gold_columns = _gold_columns_from_row(row, system.linker.column_names)
+    full_schema_row_list = _full_schema_rows(system)
+    metrics: dict[str, Any] = {"idx": idx, "question": question}
+
+    if prefix == "full_schema":
+        output = await _run_full_schema_once(system, question, full_schema_prompt)
+        recall_schema = full_schema_row_list
+    elif prefix == "topk_schema":
+        topk_stages, _cliff_stages = await _prepare_shared_retrieval_stages(system, question)
+        output = await _run_topk_schema_once(system, question, stages=topk_stages)
+        recall_schema = topk_stages.get("topk_schema") or []
+    elif prefix == "cliff_schema":
+        _topk_stages, cliff_stages = await _prepare_shared_retrieval_stages(system, question)
+        output = await _run_cliff_schema_once(system, question, stages=cliff_stages)
+        recall_schema = cliff_stages.get("cliff_schema") or []
+    elif prefix == "main_system":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_system_once(system, question, stages=stages)
+        recall_schema = stages.get("plan_schema") or []
+    else:
+        raise ValueError(f"unsupported schema compare config: {prefix}")
+
+    metrics.update(
+        _record_metrics(
+            output,
+            prefix=prefix,
+            raw_gt=raw_gt,
+            recall_schema=recall_schema,
+            gold_columns=gold_columns,
+        )
+    )
+    if prefix == "main_system":
+        metrics["__detail__"] = _build_main_system_detail_record(
+            idx=idx,
+            question=question,
+            raw_gt=raw_gt,
+            output=output,
+        )
+    _normalize_recall_key(metrics, prefix, recall_key)
+    return metrics
+
+
+async def _run_ablation_config_one(
+    *,
+    system,
+    row: dict,
+    idx: int,
+    full_schema_prompt: str,
+    config: tuple[str, str, str],
+) -> dict:
+    _label, prefix, recall_key = config
+    question = str(row.get("生成问题") or "").strip()
+    raw_gt = row.get("生成结果")
+    gold_columns = _gold_columns_from_row(row, system.linker.column_names)
+    full_schema_row_list = _full_schema_rows(system)
+    metrics: dict[str, Any] = {"idx": idx, "question": question}
+
+    if prefix == "main_full_schema":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_with_schema_once(
+            system,
+            question,
+            full_schema_prompt,
+            full_schema_row_list,
+            stages=stages,
+        )
+        recall_schema = full_schema_row_list
+    elif prefix == "main_topk_schema":
+        stages = await _prepare_single_pipeline_async(system, question)
+        topk_stages = _stages_from_candidate_pack(
+            system,
+            question,
+            stages["candidate_pack"],
+            cliff=False,
+        )
+        output = await _run_main_with_schema_once(
+            system,
+            question,
+            topk_stages["schema_prompt"],
+            topk_stages["topk_schema"],
+            stages=stages,
+        )
+        recall_schema = topk_stages.get("topk_schema") or []
+    elif prefix == "main_direct_only":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_single_path_once(system, question, "direct", stages=stages)
+        recall_schema = stages.get("plan_schema") or []
+    elif prefix == "main_icl_only":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_single_path_once(system, question, "icl", stages=stages)
+        recall_schema = stages.get("plan_schema") or []
+    elif prefix == "main_intent_plan_only":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_single_path_once(system, question, "intent_plan", stages=stages)
+        recall_schema = stages.get("plan_schema") or []
+    elif prefix == "main_no_refiner":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_no_refiner_once(system, question, stages=stages)
+        recall_schema = stages.get("plan_schema") or []
+    elif prefix == "main_no_entity":
+        output = await _run_main_no_entity_once(system, question)
+        recall_schema = (output.get("stages") or {}).get("plan_schema") or []
+    elif prefix == "main_no_judge":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_no_judge_once(system, question, stages=stages)
+        recall_schema = stages.get("plan_schema") or []
+    else:
+        raise ValueError(f"unsupported ablation config: {prefix}")
+
+    metrics.update(
+        _record_metrics(
+            output,
+            prefix=prefix,
+            raw_gt=raw_gt,
+            recall_schema=recall_schema,
+            gold_columns=gold_columns,
+        )
+    )
+    _normalize_recall_key(metrics, prefix, recall_key)
     return metrics
 
 
@@ -1218,6 +1459,81 @@ async def _run_parallel_eval(
     return [r or {} for r in results]
 
 
+async def _run_parallel_config_eval(
+    *,
+    system,
+    eval_rows: list[dict],
+    full_schema_prompt: str,
+    runner,
+    label: str,
+    config: tuple[str, str, str],
+    concurrency: int,
+) -> list[dict]:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    results: list[dict | None] = [None] * len(eval_rows)
+    _experiment_label, prefix, _recall_key = config
+
+    async def _guarded_run(pos: int, row: dict) -> None:
+        async with semaphore:
+            idx = pos + 1
+            try:
+                results[pos] = await runner(
+                    system=system,
+                    row=row,
+                    idx=idx,
+                    full_schema_prompt=full_schema_prompt,
+                    config=config,
+                )
+                print(f"[{label}:{prefix}][{idx}/{len(eval_rows)}] done")
+            except Exception as exc:
+                print(f"[{label}:{prefix}][{idx}/{len(eval_rows)}] error: {type(exc).__name__}: {exc}")
+                results[pos] = {"idx": idx, "question": str(row.get("生成问题") or "")}
+
+    await asyncio.gather(*[_guarded_run(i, row) for i, row in enumerate(eval_rows)])
+    return [r or {} for r in results]
+
+
+async def _run_config_group_with_resume(
+    *,
+    system,
+    eval_rows: list[dict],
+    full_schema_prompt: str,
+    configs: list[tuple[str, str, str]],
+    output_path: Path,
+    detail_output_path: Path | None,
+    runner,
+    label: str,
+    concurrency: int,
+) -> list[dict]:
+    _print_resume_state(label, output_path, configs)
+    completed = _completed_labels(output_path)
+
+    for config in configs:
+        experiment_label, prefix, _recall_key = config
+        if experiment_label in completed:
+            print(f"[Resume][{label}] skip completed: {experiment_label}")
+            continue
+
+        rows = await _run_parallel_config_eval(
+            system=system,
+            eval_rows=eval_rows,
+            full_schema_prompt=full_schema_prompt,
+            runner=runner,
+            label=label,
+            config=config,
+            concurrency=concurrency,
+        )
+        detail_rows = [row["__detail__"] for row in rows if isinstance(row, dict) and "__detail__" in row]
+        if detail_output_path and detail_rows:
+            _append_jsonl_rows(detail_output_path, detail_rows)
+        summary_row = _build_summary_rows(rows, [config])[0]
+        _append_csv_row(output_path, summary_row, SUMMARY_FIELDNAMES)
+        completed.add(experiment_label)
+        print(f"[Resume][{label}] saved: {experiment_label} ({prefix}) -> {output_path}")
+
+    return _read_csv_rows(output_path)
+
+
 async def main_async(args: argparse.Namespace) -> None:
     from pipeline.system import TextToSQLSystem
 
@@ -1240,6 +1556,21 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.ablation_output
         else out_dir / "ablation_summary.csv"
     )
+    main_system_detail_path = (
+        Path(args.main_system_detail_output)
+        if args.main_system_detail_output
+        else out_dir / "main_system_outputs.jsonl"
+    )
+    if args.overwrite:
+        if mode in {"1", "both"} and schema_compare_path.exists():
+            schema_compare_path.unlink()
+            print(f"[Overwrite] removed: {schema_compare_path}")
+        if mode in {"2", "both"} and ablation_path.exists():
+            ablation_path.unlink()
+            print(f"[Overwrite] removed: {ablation_path}")
+        if mode in {"1", "both"} and main_system_detail_path.exists():
+            main_system_detail_path.unlink()
+            print(f"[Overwrite] removed: {main_system_detail_path}")
 
     global _PATH_PARALLEL
     _PATH_PARALLEL = not bool(args.no_path_parallel)
@@ -1259,31 +1590,35 @@ async def main_async(args: argparse.Namespace) -> None:
     }
 
     if mode in {"1", "both"}:
-        schema_rows = await _run_parallel_eval(
+        schema_summary = await _run_config_group_with_resume(
             system=system,
             eval_rows=eval_rows,
             full_schema_prompt=full_prompt,
-            runner=_run_schema_compare_one,
+            configs=SCHEMA_COMPARE_CONFIGS,
+            output_path=schema_compare_path,
+            detail_output_path=main_system_detail_path,
+            runner=_run_schema_compare_config_one,
             label="SchemaCompare",
             concurrency=concurrency,
         )
-        schema_summary = _build_summary_rows(schema_rows, SCHEMA_COMPARE_CONFIGS)
-        _write_csv(schema_compare_path, schema_summary, SUMMARY_FIELDNAMES)
         report["schema_compare_summary"] = schema_summary
         report["schema_compare_csv"] = str(schema_compare_path)
+        if main_system_detail_path.exists():
+            report["main_system_detail_jsonl"] = str(main_system_detail_path)
         print(f"schema compare summary CSV: {schema_compare_path}")
 
     if mode in {"2", "both"}:
-        ablation_rows = await _run_parallel_eval(
+        ablation_summary = await _run_config_group_with_resume(
             system=system,
             eval_rows=eval_rows,
             full_schema_prompt=full_prompt,
-            runner=_run_ablation_one,
+            configs=ABLATION_CONFIGS,
+            output_path=ablation_path,
+            detail_output_path=None,
+            runner=_run_ablation_config_one,
             label="Ablation",
             concurrency=concurrency,
         )
-        ablation_summary = _build_summary_rows(ablation_rows, ABLATION_CONFIGS)
-        _write_csv(ablation_path, ablation_summary, SUMMARY_FIELDNAMES)
         report["ablation_summary"] = ablation_summary
         report["ablation_csv"] = str(ablation_path)
         print(f"ablation summary CSV: {ablation_path}")
@@ -1325,6 +1660,16 @@ def main() -> None:
         "--ablation-output",
         default="",
         help="模式2汇总 CSV 路径，默认 tests/results/ablation_summary.csv",
+    )
+    parser.add_argument(
+        "--main-system-detail-output",
+        default="",
+        help="主系统逐题 JSONL 日志路径，默认 tests/results/main_system_outputs.jsonl",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已有汇总 CSV；默认续写并跳过已完成的对比实验",
     )
     parser.add_argument("--limit", type=int, default=0, help="仅评测前 N 条，0 表示全部")
     parser.add_argument(

@@ -207,7 +207,7 @@ class SQLRefiner:
 
     @staticmethod
     def resolve_tie(tie_candidates: list[dict]) -> dict:
-        priority_order = ["json_sql", "icl", "direct", "plan"]
+        priority_order = ["json_sql", "icl", "direct", "intent_plan"]
         for priority in priority_order:
             for cand in tie_candidates:
                 if priority in cand.get("type", "").lower():

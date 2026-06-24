@@ -76,7 +76,6 @@ class Settings:
             str(MODELS_DIR / "my_schema_pruner_model"),
         )
     )
-
     # ── Retrieval-first schema linking ──
     candidate_value_top_k: int = 3
     # candidate_exact_bonus: float = 0.35
