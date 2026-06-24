@@ -10,7 +10,9 @@ from openai import OpenAI
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
+from config import get_llm_api_key, get_llm_base_url, get_llm_model
 from construct import get_multiple_filled_qa_pairs
+from multi_result_utils import MULTI_RESULT_SEP, split_answer_template_top_level
 from training.dataset_io import normalize_and_deduplicate_dataframe, normalize_cell_text
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,9 +53,10 @@ NUMERIC_COLS = [
 ]
 
 
+LLM_MODEL = get_llm_model()
 client = OpenAI(
-    api_key="sk-cbbd58b6e9004c30a02c551bdb2f0e9e",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key=get_llm_api_key(),
+    base_url=get_llm_base_url(),
     timeout=600,
     max_retries=3
 )
@@ -75,61 +78,120 @@ def clean_value(x):
     return s
 
 
+ANSWER_TEMPLATE_HINTS = {
+    "field": "查询目标为“{target}”字段，最终答案为：{answer}",
+    "multi_field": "查询目标为“{target}”这些字段的组合结果，最终答案为：{answer}",
+    "count": "查询目标为满足问题条件的数据条数，最终答案为：{answer}",
+    "sum": "查询目标为“{target}”字段的求和结果，最终答案为：{answer}",
+    "avg": "查询目标为“{target}”字段的平均值，最终答案为：{answer}",
+    "count1": "查询目标为“{target}”字段的去重数量，最终答案为：{answer}",
+    "rank": "查询目标为按“{rank_target}”{direction}排序后返回“{return_target}”字段，范围为{top_n}，最终答案为：{answer}",
+    "raw": "查询目标由回答模板“{template}”定义，最终答案为：{answer}",
+}
+
+
+def _format_slot_mapping(slot_mapping: dict) -> str:
+    if not slot_mapping:
+        return "无"
+    return "；".join([f"{k}={v}" for k, v in slot_mapping.items()])
+
+
+def _split_fields(field_text: str) -> list:
+    return [x.strip() for x in re.split(r"[,，]", field_text) if x.strip()]
+
+
+def build_answer_template_hint(answer_template: str, answer: str) -> str:
+    answer_template = str(answer_template or "").strip()
+    answer = str(answer or "").strip()
+
+    sub_templates = split_answer_template_top_level(answer_template)
+    if len(sub_templates) > 1:
+        sub_answers = str(answer).split(MULTI_RESULT_SEP)
+        hints = []
+        for idx, sub_template in enumerate(sub_templates):
+            sub_answer = sub_answers[idx].strip() if idx < len(sub_answers) else answer
+            hints.append(build_answer_template_hint(sub_template, sub_answer))
+        return "；".join(hints)
+
+    if re.fullmatch(r"count\{\s*\}", answer_template, re.IGNORECASE):
+        return ANSWER_TEMPLATE_HINTS["count"].format(answer=answer)
+
+    rank_match = re.fullmatch(
+        r"(listdown|listup)\{\s*([^}]+?)\s*\}\{\s*([^}]+?)\s*\}\*(\d+|\*)",
+        answer_template,
+        re.IGNORECASE,
+    )
+    if rank_match:
+        direction = "降序" if rank_match.group(1).lower() == "listdown" else "升序"
+        agg_col = rank_match.group(2).strip()
+        return_cols = "、".join(_split_fields(rank_match.group(3)))
+        top_n = rank_match.group(4)
+        rank_target = "记录数量" if agg_col.lower() == "count" else f"{agg_col}求和结果"
+        top_n_text = "全部结果" if top_n == "*" else f"前 {top_n} 个结果"
+        return ANSWER_TEMPLATE_HINTS["rank"].format(
+            rank_target=rank_target,
+            direction=direction,
+            return_target=return_cols,
+            top_n=top_n_text,
+            answer=answer,
+        )
+
+    agg_match = re.fullmatch(r"(sum|avg|count1)\{\s*([^}]+?)\s*\}", answer_template, re.IGNORECASE)
+    if agg_match:
+        agg_type = agg_match.group(1).lower()
+        target = agg_match.group(2).strip()
+        return ANSWER_TEMPLATE_HINTS[agg_type].format(target=target, answer=answer)
+
+    fields = [x.strip() for x in re.findall(r"\{([^}]+)}", answer_template) if x.strip()]
+    if fields:
+        if len(fields) == 1:
+            fields = _split_fields(fields[0]) or fields
+        key = "field" if len(fields) == 1 else "multi_field"
+        return ANSWER_TEMPLATE_HINTS[key].format(target="、".join(fields), answer=answer)
+
+    return ANSWER_TEMPLATE_HINTS["raw"].format(template=answer_template, answer=answer)
+
+
+def build_llm_case_source(index: int, pair: dict, answer_template: str) -> str:
+    slot_mapping = pair.get("slot_mapping", {}) or {}
+    return (
+        f"Case {index}:\n"
+        f"   [填充后的问题]: {pair['filled_question']}\n"
+        f"   [标准答案]: {pair['answer']}\n"
+        f"   [槽位信息]: {_format_slot_mapping(slot_mapping)}\n"
+        f"   [查询目标提示]: {build_answer_template_hint(answer_template, pair['answer'])}"
+    )
+
+
 def generate_batch_similar_questions(qa_pairs: list, q_template:str,a_template:str,client_llms=client,) -> list:
     num = len(qa_pairs)
     examples_list = []
     for i, pair in enumerate(qa_pairs):
-        # 获取该条数据对应的真实槽位值（即数据库里的精确值）
-        slots = pair.get('slot_mapping', {})
-
-        # 格式化槽位信息，方便 LLM 阅读
-        # 例如：Entities: { "物资描述": "10kV真空断路器", "供应商": "江苏xx公司" }
-        slots_str = ", ".join([f"{k}:'{v}'" for k, v in slots.items()])
-
-        example_str = (
-            f"Case {i + 1}:\n"
-            f"   [关键实体数据]: {{{slots_str}}}\n"
-            f"   [原始机械问题]: {pair['filled_question']}\n"
-            f"   [对应标准答案]: {pair['answer']}"
-        )
-        examples_list.append(example_str)
+        examples_list.append(build_llm_case_source(i + 1, pair, a_template))
 
     examples = "\n\n".join(examples_list)
 
-    system_prompt = f"""你是一个Text-to-SQL数据集增强专家。
-    
-你的任务是将给定的“原始问题”改写成**真实用户**在查询数据库时可能使用的自然语言问题。用户通常会模糊表达、使用简称或口语化提问。
+    system_prompt = f"""你是一个 Text-to-SQL 数据集增强助手。
 
-【输入信息说明】
-- **[数据库实体]**：这是问题中涉及的数据库精确值（Ground Truth）。
-- **[原始问题]**：这是由模版生成的机械化问题，语法可能生硬。
-- **[标准答案]**：这是查询的最终结果。
+任务：根据每个 Case 的“填充后的问题、标准答案、槽位信息、查询目标提示”，把问题改写成更自然的用户问法。
 
-【改写核心要求】
-1. **意图一致**：新问题查询不脱离答案模版。对于查询具体内容，答案模版表示答案所在列；对于计算问题，答案模版表示计算方式，一切模糊歧义以[答案模版]为标准
-2. **实体模糊化（高优先级）**：
-   - 必须参考 [数据库实体] 中的值。
-   - **模拟用户输入**：针对原始问题，采用不同角度、想法等但**不能偏离问题原本含义**的方法重新提问。
-   - **保留关键特征**：模糊化不能导致歧义（例如不能把 "A型" 改成 "B型"）。
-   -**语义模糊**对问题中所提到的查询关键词，可以轻微缩写但不可以进行大部分歧义改写。
-   -**语义模糊**对所提到的目标，可以进行轻微歧义改写，但不能脱离[答案模版]、因为答案模版表示答案所在列或者答案计算方式
-3. **句式多样性**：
-   - 打破原始问题的语法结构。
-   -自由编排内容，答案和查询逻辑不要脱离[标准答案]
-   - 使用口语（"这个物料的编码是多少？"）。
-4. **格式严格**：只输出 {num} 行，不要包含任何序号或多余解释。问题不要使用任何时间描述，数据集中不存在时间列。禁止生成的小问题数量大于原始问题的数量。
-   每行格式：生成的问题|||答案:对应的回答
+硬性要求：
+1. 只能改变问法，不能改变查询目标；查询目标以[查询目标提示]为准。
+2. [槽位信息]中的值必须在生成问题中原样保留，不能替换、缩写、扩写、模糊化或调整数字/符号/大小写。
+3. 答案必须直接使用[标准答案]，不要重新计算或改写答案。
+4. 只输出 {num} 行，不要序号、解释、表头；每行格式：生成的问题|||答案:对应的回答。
+5. 问题不要添加时间条件，数据集中没有时间列。
 
--**[问题模版]**:{q_template}
--**[答案模版]**:{a_template}
-现在开始处理以下 {num} 组数据：
-                    """
+[问题模版]: {q_template}
+[答案模版]: {a_template}
+现在处理以下 {num} 组数据：
+"""
 
     user_prompt = examples
 
     try:
         completion = client_llms.chat.completions.create(
-            model="qwen3-max-2026-01-23",  # 或你使用的其他模型
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -341,7 +403,7 @@ def main():
             print(f"   ✅ 基础生成 {len(qa_list)} 条，SQL校验通过 {len(valid_qa_list)} 条 -> 准备 LLM 改写")
 
             # 调用 LLM 进行改写 (LLM 不需要看 SQL，只需要看问题和答案)
-            rewritten_data = generate_batch_similar_questions(qa_list,q_template= q_temp,a_template= a_template)
+            rewritten_data = generate_batch_similar_questions(valid_qa_list, q_template=q_temp, a_template=a_template)
             if rewritten_data is None:
                 print("   🚫 LLM 调用异常（如连接超时），放弃本次结果。")
                 print("      -> 本批次未写入文件，下次 Resume 时将自动重试。")
@@ -431,4 +493,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
