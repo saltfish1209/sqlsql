@@ -23,6 +23,19 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 
+
+def _format_metric_value_like_sql(value):
+    """仅用于聚合计算值；不要用于物料编码、批次号等字段值。"""
+    text = str(value).strip()
+    if isinstance(value, str) and re.fullmatch(r"0\d+", text):
+        return text
+    try:
+        num = round(float(value), 2)
+        return str(int(num)) if num.is_integer() else str(num)
+    except Exception:
+        return text
+
+
 def init_db(df_raw):
     conn = sqlite3.connect(':memory:')
     df_raw.to_sql('procurement_table',conn,index=False)
@@ -432,7 +445,7 @@ def _format_sub_answer(sub_result: dict) -> str:
     if agg:
         if not rows_data:
             return ""
-        return str(rows_data[0].get('value', ''))
+        return _format_metric_value_like_sql(rows_data[0].get('value', ''))
     rank_cols = sub_result.get('rank_return_cols') or []
     cells = []
     for row_dict in rows_data:
@@ -603,7 +616,7 @@ def get_multiple_filled_qa_pairs(template_row: pd.DataFrame, df_raw: pd.DataFram
                 sub_answer_strs = [_format_sub_answer(sub) for sub in result['multi_results']]
                 answer = MULTI_RESULT_SEP.join(sub_answer_strs)
             elif result['aggregation']:
-                answer = str(result['results'][0]['value'])
+                answer = _format_metric_value_like_sql(result['results'][0]['value'])
             else:
                 rank_cols = result.get('rank_return_cols') or []
                 all_rows = []
@@ -781,6 +794,5 @@ if __name__ == '__main__':
     finally:
         conn.close()
         print("\n🏁 调试结束")
-
 
 

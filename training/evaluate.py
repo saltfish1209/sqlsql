@@ -159,6 +159,18 @@ def _name_only_set(s: set[str]) -> set[str]:
     return out
 
 
+def _flatten_result_cells(parsed) -> set[str]:
+    """把 set/list[set] 结果降到单元格集合，用于多结果与单 SQL 多列的保守兜底。"""
+    rows = _flatten_result_values(parsed)
+    cells: set[str] = set()
+    for row in rows:
+        for cell in str(row).split("|"):
+            cell = cell.strip()
+            if cell:
+                cells.add(cell)
+    return cells
+
+
 def _compare_results(gt, pred) -> tuple[bool, float, str]:
     """
     返回 (is_correct, score, match_type)
@@ -169,6 +181,8 @@ def _compare_results(gt, pred) -> tuple[bool, float, str]:
     gt_is_list = isinstance(gt, list)
     pred_is_list = isinstance(pred, list)
     if gt_is_list != pred_is_list:
+        if _flatten_result_cells(gt) == _flatten_result_cells(pred):
+            return True, 1.0, "multi_flat"
         return False, 0.0, "shape_mismatch"
 
     if gt_is_list:
