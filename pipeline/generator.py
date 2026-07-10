@@ -6,8 +6,8 @@ import re
 from openai import AsyncOpenAI, APIConnectionError
 
 from config.settings import settings
-from pipeline.fewshot_index import FewShotFaissStore
 from pipeline.intent_planner import IntentPlanner
+from pipeline.prompt_rules import aggregation_rule_text
 from pipeline.utils import TokenTracker, debug_print
 
 
@@ -20,6 +20,8 @@ _SQL_JSON_SCHEMA = {
 
 class SQLGenerator:
     def __init__(self, client: AsyncOpenAI, model: str, embed_model_path: str | None = None):
+        from pipeline.fewshot_index import FewShotFaissStore
+
         self.client = client
         self.model = model
         self.fewshot_store = FewShotFaissStore(
@@ -55,17 +57,31 @@ class SQLGenerator:
 
                 obj = json.loads(json_match.group(0))
                 if isinstance(obj, dict) and obj.get("sql"):
-                    return str(obj.get("sql") or "").strip()
+                    return SQLGenerator.normalize_sql_literal_spaces(str(obj.get("sql") or "").strip())
             except Exception:
                 pass
         match = re.search(r"```sql\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            return SQLGenerator.normalize_sql_literal_spaces(match.group(1).strip())
         match = re.search(r"```\s*(.*?)\s*```", text, flags=re.DOTALL)
         if match:
-            return match.group(1).strip()
+            return SQLGenerator.normalize_sql_literal_spaces(match.group(1).strip())
         match = re.search(r"(SELECT\s+.*)", text, flags=re.DOTALL | re.IGNORECASE)
-        return match.group(1).strip() if match else text.strip()
+        sql = match.group(1).strip() if match else text.strip()
+        return SQLGenerator.normalize_sql_literal_spaces(sql)
+
+    @staticmethod
+    def normalize_sql_literal_spaces(sql: str) -> str:
+        """删除 SQL 单引号业务值内部空白；不改 SQL 语法空格和双引号列名。"""
+        if not sql:
+            return ""
+
+        def repl(match: re.Match) -> str:
+            literal = match.group(0)
+            inner = re.sub(r"\s+", "", literal[1:-1])
+            return f"'{inner}'"
+
+        return re.sub(r"'(?:''|[^'])*'", repl, sql)
 
     @staticmethod
     def highlight_question_for_prompt(question: str) -> str:
@@ -170,13 +186,15 @@ class SQLGenerator:
             "多候选要求：每条 SQL 必须对应用户问题中的明确查询意图；可以在 SELECT、DISTINCT、"
             "聚合或宽松匹配方式上做合理差异，但不得为了覆盖候选字段而遍历生成无问题依据的 SELECT/WHERE。"
         )
+        aggregation_rule = aggregation_rule_text()
         prompt_prefix = "# Role\n你是一名 SQL 专家。请只基于给定 Schema 生成 SQLite SQL。\n\n" + fewshot_block
         prompt_suffix = (
             f"## Schema\n{schema_prompt}\n\n"
             f"## 用户问题\n{highlighted_question}\n\n"
             "## 生成规则\n"
             f"{self._sql_generation_rules()}"
-            f"{diversity_rule}"
+            f"{diversity_rule}\n"
+            f"{aggregation_rule}"
             '\n\n## 输出格式\n只输出 JSON：{"sql": "SELECT ..."}。\n'
         )
         route_prompts = {

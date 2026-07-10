@@ -15,6 +15,7 @@ from sql_generator import SQLQueryBuilder
 from training.dataset_io import normalize_cell_text
 from multi_result_utils import (
     MULTI_RESULT_SEP,
+    ROW_RESULT_SEP,
     split_answer_template_top_level,
 )
 
@@ -438,7 +439,7 @@ def _format_sub_answer(sub_result: dict) -> str:
     把单个子结果格式化成字符串。规则与 get_multiple_filled_qa_pairs 中
     单结果分支保持一致：
       - 聚合 (count/sum/avg/count1) → 直接取 value
-      - 列表 (select/listdown/listup) → 行间 '，'，行内 '|'
+      - 列表 (select/listdown/listup) → 行间 ROW_RESULT_SEP，行内 '|'
     """
     agg = sub_result.get('aggregation')
     rows_data = sub_result.get('results') or []
@@ -457,7 +458,7 @@ def _format_sub_answer(sub_result: dict) -> str:
         if not vals:
             continue
         cells.append("|".join(vals))
-    return "，".join(cells)
+    return ROW_RESULT_SEP.join(cells)
 
 
 def _extract_and_compute_multi(
@@ -632,8 +633,7 @@ def get_multiple_filled_qa_pairs(template_row: pd.DataFrame, df_raw: pd.DataFram
                     row_str = "|".join(vals)
                     all_rows.append(row_str)
 
-                # 将多行数据用中文逗号或分号连接
-                answer = "，".join(all_rows)
+                answer = ROW_RESULT_SEP.join(all_rows)
 
             results.append({
                 "filled_question": filled_question,
@@ -794,5 +794,4 @@ if __name__ == '__main__':
     finally:
         conn.close()
         print("\n🏁 调试结束")
-
 

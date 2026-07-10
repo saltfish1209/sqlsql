@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
-
-from openai import AsyncOpenAI, APIConnectionError
+from openai import AsyncOpenAI
 
 from config.settings import settings
-from pipeline.checkers import SQLCheckerChain, CheckIssue
+from pipeline.consensus_vote import annotate_candidate_risk
 from pipeline.db_engine import DBEngine
 from pipeline.generator import SQLGenerator
-from pipeline.utils import TokenTracker, debug_print
+from pipeline.utils import TokenTracker
 
 
 class SQLRefiner:
@@ -16,7 +14,6 @@ class SQLRefiner:
         self.client = client
         self.model = model
         self.db = db
-        self.checker = SQLCheckerChain(db)
 
     async def refine_async(
         self,
@@ -27,60 +24,226 @@ class SQLRefiner:
         max_retries: int | None = None,
         *,
         repair_schema_prompt: str | None = None,
+        question: str | None = None,
+        judge_schema_prompt: str | None = None,
+        intent_plan: dict | None = None,
     ) -> list[dict]:
         refined = []
+        failure_order = 0
+        literal_exists = getattr(self.db, "check_literal_in_column", None)
         for cand in candidates:
             repaired = dict(cand)
             result, error = self.db.execute_sql(repaired["sql"])
-            issues = self.checker.check(
-                repaired["sql"],
-                result=result if error is None else None,
-                execution_error=error,
-            )
-            if issues:
-                repaired["checker_issues"] = issues
-                repaired["error_msg"] = self._format_checker_feedback(issues)
+            repaired["execution_error"] = error
+            repaired["refiner_debug"] = {
+                "judge_rounds": [],
+                "refiner_rounds": [],
+            }
+            if error:
+                failure_order += 1
+                repaired["error_msg"] = error
                 repaired.setdefault("result", None)
                 repaired["status"] = "needs_repair"
-                sql_before = repaired.get("sql")
-                repaired = await self._attempt_llm_repair(
-                    schema_prompt=repair_schema_prompt or schema_prompt,
-                    candidate=repaired,
-                    valid_columns=top20_candidates,
-                    tracker=tracker,
-                    max_retries=max_retries or settings.max_repair_retries,
-                    repair_reason="execution",
-                )
-                repaired["refiner_debug"] = {
-                    "check": self._issues_to_dict(issues),
-                    "refiner": {
-                        "sql_before": sql_before,
-                        "sql_after": repaired.get("sql"),
-                        "status": repaired.get("status"),
-                        "error_msg": repaired.get("error_msg"),
-                        "post_check": self._issues_to_dict(repaired.get("checker_issues") or []),
-                    },
-                }
-                refined.append(repaired)
+                repaired["failure_order"] = failure_order
+                repaired["error_history"] = [
+                    {
+                        "order": failure_order,
+                        "round": 0,
+                        "sql": repaired.get("sql"),
+                        "error": error,
+                    }
+                ]
             else:
                 repaired["status"] = "success"
                 repaired["result"] = result if result is not None else []
+            annotate_candidate_risk(repaired, literal_exists)
+            refined.append(repaired)
+
+        max_rounds = max(1, int(max_retries or settings.max_repair_retries))
+        for round_no in range(1, max_rounds + 1):
+            judge_schema = judge_schema_prompt or schema_prompt
+            judge_items: list[dict] = []
+            judge_debug = {
+                "ran": False,
+                "round": round_no,
+                "schema": "cliff",
+                "items": [],
+                "candidate_sqls": [
+                    {
+                        "index": idx,
+                        "type": item.get("type"),
+                        "variant_id": item.get("variant_id"),
+                        "sql": item.get("sql"),
+                        "error": item.get("execution_error") or "",
+                        "value_link_probe": item.get("value_link_probe") or {},
+                    }
+                    for idx, item in enumerate(refined)
+                ],
+            }
+            if settings.enable_sql_consistency_judge and question:
+                from pipeline.sql_consistency_judge import judge_sql_batch_consistency
+
+                judge_items = await judge_sql_batch_consistency(
+                    self.client,
+                    self.model,
+                    question=question,
+                    schema_prompt=judge_schema,
+                    candidates=refined,
+                    intent_plan=intent_plan,
+                    tracker=tracker,
+                )
+                judge_debug = {
+                    **judge_debug,
+                    "ran": True,
+                    "items": judge_items,
+                }
+
+            targets: list[tuple[int, dict]] = []
+            target_reasons: dict[int, str] = {}
+            seen_target_ids: set[int] = set()
+            for item in judge_items:
+                idx = item.get("index")
+                if not isinstance(idx, int) or idx < 0 or idx >= len(refined):
+                    continue
+                target = refined[idx]
+                status = str(item.get("status") or "").strip().lower()
+                if status not in {"pass", "suspicious", "fail"}:
+                    status = "fail" if item.get("correct") is False else "pass"
+                risk = int(item.get("risk") if item.get("risk") is not None else {"pass": 0, "suspicious": 1, "fail": 2}[status])
+                reason = str(item.get("reason") or "").strip()
+                if target.get("judge_status") is None:
+                    target["judge_status"] = status
+                    target["judge_risk"] = risk
+                    target["judge_reason"] = reason
+                elif target.get("is_refined"):
+                    target["post_repair_judge_status"] = status
+                    target["post_repair_judge_risk"] = risk
+                    target["post_repair_judge_reason"] = reason
+                if reason:
+                    target.setdefault("judge_suggestion", reason)
+                    target_reasons[id(target)] = reason
+                if (
+                    status == "fail"
+                    and not target.get("_repair_attempted")
+                    and id(target) not in seen_target_ids
+                ):
+                    targets.append((idx, target))
+                    seen_target_ids.add(id(target))
+
+            if judge_debug.get("ran"):
+                for item in refined:
+                    debug = item.setdefault("refiner_debug", {})
+                    debug.setdefault("judge_rounds", []).append(judge_debug)
+
+            for idx, item in enumerate(refined):
+                if (
+                    item.get("status") != "success"
+                    and not item.get("_repair_attempted")
+                    and id(item) not in seen_target_ids
+                ):
+                    item.setdefault("judge_status", "fail")
+                    item.setdefault("judge_risk", 2)
+                    if item.get("execution_error") and not item.get("judge_reason"):
+                        item["judge_reason"] = str(item.get("execution_error") or "")
+                    targets.append((idx, item))
+                    seen_target_ids.add(id(item))
+
+            if not targets:
+                break
+
+            failed_sqls = [
+                {
+                    "order": item.get("failure_order"),
+                    "type": item.get("type"),
+                    "variant_id": item.get("variant_id"),
+                    "sql": item.get("sql"),
+                    "error": item.get("execution_error") or item.get("error_msg"),
+                }
+                for _idx, item in targets
+            ]
+            judge_debug["failed_sqls"] = failed_sqls
+
+            repair_schema = (
+                judge_schema_prompt or schema_prompt
+                if round_no == 1
+                else repair_schema_prompt or schema_prompt
+            )
+            repair_schema_name = "cliff" if round_no == 1 else "topk"
+            for target_index, target in targets:
+                target["_repair_attempted"] = True
+                sql_before = target.get("sql")
+                error_before = target.get("execution_error") or target.get("error_msg") or ""
+                judge_reason = target_reasons.get(id(target), target.get("judge_suggestion") or target.get("judge_reason") or "")
+                repair_candidate = dict(target)
+                repair_candidate.pop("_repair_attempted", None)
+                repair_candidate["is_refined"] = True
+                repair_candidate["refined_from"] = target_index
+                repair_candidate["refiner_round"] = round_no
+                repair_candidate["source_sql"] = sql_before
+                target_debug = target.get("refiner_debug") or {}
+                repair_candidate["refiner_debug"] = {
+                    "judge_rounds": list(target_debug.get("judge_rounds") or []),
+                    "refiner_rounds": list(target_debug.get("refiner_rounds") or []),
+                }
+                if judge_reason:
+                    repair_candidate["error_msg"] = (
+                        f"{error_before}\nJudge suggestion: {judge_reason}"
+                        if error_before
+                        else judge_reason
+                    )
+                    repair_candidate["judge_suggestion"] = judge_reason
+                repaired = await self._attempt_llm_repair(
+                    schema_prompt=repair_schema,
+                    candidate=repair_candidate,
+                    valid_columns=top20_candidates,
+                    tracker=tracker,
+                    max_retries=max_rounds,
+                    judge_suggestion=judge_reason,
+                    repair_round=round_no,
+                    schema_name=repair_schema_name,
+                )
+                repaired["is_refined"] = True
+                repaired["refined_from"] = target_index
+                repaired["refiner_round"] = round_no
+                repaired["source_sql"] = sql_before
+                repaired["repair_changed"] = (
+                    str(repaired.get("sql") or "").strip() != str(sql_before or "").strip()
+                )
+                if not repaired["repair_changed"]:
+                    repaired["status"] = "repair_failed"
+                    repaired["error_msg"] = "REPAIR_NO_CHANGE"
+                elif repaired.get("status") == "success":
+                    repaired["post_repair_judge_status"] = "suspicious"
+                    repaired["post_repair_judge_risk"] = 1
+                    repaired["post_repair_judge_reason"] = "repair_pending_rejudge"
+                annotate_candidate_risk(repaired, literal_exists)
+                if repaired.get("status") != "success":
+                    failure_order += 1
+                    repaired["failure_order"] = failure_order
+                    repaired.setdefault("error_history", []).append(
+                        {
+                            "order": failure_order,
+                            "round": round_no,
+                            "sql": repaired.get("sql"),
+                            "error": repaired.get("execution_error") or repaired.get("error_msg"),
+                        }
+                    )
+                refiner_round = {
+                    "round": round_no,
+                    "schema": repair_schema_name,
+                    "sql_before": sql_before,
+                    "sql_after": repaired.get("sql"),
+                    "status": repaired.get("status"),
+                    "error_msg": repaired.get("error_msg"),
+                    "post_execution_error": repaired.get("execution_error"),
+                    "judge_suggestion": judge_reason,
+                }
+                debug = repaired.setdefault("refiner_debug", {})
+                debug.setdefault("refiner_rounds", []).append(refiner_round)
+                debug["judge"] = judge_debug
+                debug["refiner"] = refiner_round
                 refined.append(repaired)
         return refined
-
-    @staticmethod
-    def _format_checker_feedback(issues: list[CheckIssue]) -> str:
-        return "\n".join(
-            f"{issue.code}: {issue.message} 修复建议: {issue.directive}"
-            for issue in issues
-        )
-
-    @staticmethod
-    def _issues_to_dict(issues: list[CheckIssue]) -> list[dict]:
-        return [
-            {"code": issue.code, "message": issue.message, "directive": issue.directive}
-            for issue in (issues or [])
-        ]
 
     async def _attempt_llm_repair(
         self,
@@ -90,26 +253,20 @@ class SQLRefiner:
         tracker: TokenTracker,
         max_retries: int,
         *,
-        repair_reason: str = "execution",
+        judge_suggestion: str = "",
+        repair_round: int = 1,
+        schema_name: str = "",
     ) -> dict:
         sql = candidate.get("sql") or ""
-        if repair_reason == "semantic":
-            prompt = (
-                "你是SQL修复专家。当前 SQL 能执行，但语义审查认为其与用户问题不一致。\n"
-                "请基于断崖剪枝 Schema、用户问题、原 SQL 与执行结果，重新生成正确 SQL。\n"
-                f"[Schema]\n{schema_prompt}\n"
-                f"[错误SQL]\n{sql}\n"
-                f"[错误原因]\n{candidate.get('error_msg', '')}\n"
-                "要求：过滤值必须来自用户问题原文，禁止使用 Schema 示例值；只输出可执行 SQL，用```sql包裹。"
-            )
-        else:
-            prompt = (
-                "你是SQL修复专家。SQL 无法执行或 checker 报错，请基于 TopK 扩展 Schema 重新生成正确 SQL。\n"
-                f"[Schema]\n{schema_prompt}\n"
-                f"[错误SQL]\n{sql}\n"
-                f"[错误原因]\n{candidate.get('error_msg', '')}\n"
-                "要求：只输出可执行SQL，用```sql包裹。"
-            )
+        prompt = (
+            "你是SQL修复专家。SQL 无法执行或语义审查认为错误，请基于 Schema 与错误诊断重新生成正确 SQL。\n"
+            f"[修复轮次]\n{repair_round}/{max_retries}\n"
+            f"[Schema]\n{schema_prompt}\n"
+            f"[错误SQL]\n{sql}\n"
+            f"[错误原因]\n{candidate.get('error_msg', '')}\n"
+            f"[Judge修改建议]\n{judge_suggestion or '无'}\n"
+            "要求：只输出可执行SQL，用```sql包裹。"
+        )
         prompt += (
             "\n[最小修改原则]\n"
             "1. 只围绕错误原因修复，不要额外添加用户问题没有要求的过滤条件。\n"
@@ -131,85 +288,15 @@ class SQLRefiner:
             sql2 = SQLGenerator.extract_sql(content)
             candidate["sql"] = sql2 or sql
             result, error = self.db.execute_sql(candidate["sql"])
+            candidate["execution_error"] = error
             candidate["result"] = result if error is None else None
-            candidate["checker_issues"] = self.checker.check(candidate["sql"], result=result if error is None else None, execution_error=error)
-            if not candidate["checker_issues"]:
+            if error is None:
                 candidate["status"] = "success"
                 candidate.pop("error_msg", None)
             else:
                 candidate["status"] = "needs_repair"
+                candidate["error_msg"] = error
             return candidate
         except Exception:
+            candidate["status"] = "repair_failed"
             return candidate
-
-    async def repair_semantic_async(
-        self,
-        cliff_schema_prompt: str,
-        candidate: dict,
-        *,
-        question: str,
-        tracker: TokenTracker,
-        judge_reason: str = "",
-    ) -> dict:
-        """SQL 可执行但语义不一致时，用断崖 schema + 问题 + SQL + 结果重生成。"""
-        repaired = dict(candidate)
-        result_preview = repaired.get("result")
-        if result_preview is None:
-            result_preview = []
-        preview_lines = []
-        for row in (result_preview or [])[:5]:
-            preview_lines.append(str(list(row) if isinstance(row, (list, tuple)) else row))
-        result_text = "\n".join(preview_lines) if preview_lines else "（空结果）"
-        repaired["error_msg"] = (
-            f"语义审查不一致: {judge_reason}\n"
-            f"[用户问题]\n{question}\n"
-            f"[SQL执行结果]\n{result_text}"
-        )
-        return await self._attempt_llm_repair(
-            schema_prompt=cliff_schema_prompt,
-            candidate=repaired,
-            valid_columns=[],
-            tracker=tracker,
-            max_retries=settings.max_repair_retries,
-            repair_reason="semantic",
-        )
-
-    @staticmethod
-    def _build_relaxed_recall_schema(recall_schema: list[dict]) -> list[dict]:
-        if not recall_schema:
-            return []
-        best = max(float(x.get("相关性分数") or 0.0) for x in recall_schema)
-        threshold = best * float(getattr(settings, "candidate_cliff_min_ratio", 0.15))
-        return [x for x in recall_schema if float(x.get("相关性分数") or 0.0) >= threshold]
-
-    @staticmethod
-    def _format_schema_prompt(schema_prompt: str, top20_candidates: list[dict] | list[str]) -> str:
-        if top20_candidates and isinstance(top20_candidates[0], dict):
-            lines = []
-            for col in top20_candidates:
-                lines.append(
-                    f'- 列名：{col.get("列名", "")} | 相关性分数：{col.get("相关性分数", "")} | 列描述：{col.get("列描述", "")} | 字段类型：{col.get("字段类型", "")} | 是否枚举：{col.get("是否枚举", "")}'
-                )
-                if col.get("空值率") not in (None, ""):
-                    lines.append(f'  空值率：{col.get("空值率")}')
-                if col.get("唯一值数") not in (None, ""):
-                    lines.append(f'  唯一值数：{col.get("唯一值数")}')
-                if col.get("示例值") not in (None, ""):
-                    lines.append(f'  示例值：{col.get("示例值")}')
-                if col.get("格式") not in (None, ""):
-                    lines.append(f'  格式：{col.get("格式")}')
-                if col.get("范围") not in (None, ""):
-                    lines.append(f'  范围：{col.get("范围")}')
-            return "\n".join(lines)
-        if isinstance(valid_columns, list):
-            return json.dumps(valid_columns, ensure_ascii=False, indent=2)
-        return str(schema_prompt)
-
-    @staticmethod
-    def resolve_tie(tie_candidates: list[dict]) -> dict:
-        priority_order = ["json_sql", "icl", "direct", "intent_plan"]
-        for priority in priority_order:
-            for cand in tie_candidates:
-                if priority in cand.get("type", "").lower():
-                    return cand
-        return tie_candidates[0]

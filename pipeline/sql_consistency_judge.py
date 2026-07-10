@@ -6,6 +6,7 @@ import re
 from openai import AsyncOpenAI
 
 from config.settings import settings
+from pipeline.prompt_rules import aggregation_rule_text
 from pipeline.utils import TokenTracker, debug_print
 
 _JUDGE_SCHEMA = {
@@ -26,6 +27,64 @@ _CHOICE_SCHEMA = {
     "required": ["best_index", "原因"],
 }
 
+_BATCH_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["pass", "suspicious", "fail"]},
+                    "correct": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "status"],
+            },
+        },
+    },
+    "required": ["items"],
+}
+
+_JUDGE_STATUS_RISK = {
+    "pass": 0,
+    "suspicious": 1,
+    "fail": 2,
+}
+
+
+def _normalize_batch_judge_status(item: dict) -> tuple[str, bool, int]:
+    raw_status = str(
+        item.get("status")
+        or item.get("verdict")
+        or item.get("decision")
+        or ""
+    ).strip().lower()
+    status_aliases = {
+        "ok": "pass",
+        "true": "pass",
+        "correct": "pass",
+        "pass": "pass",
+        "warning": "suspicious",
+        "warn": "suspicious",
+        "uncertain": "suspicious",
+        "maybe": "suspicious",
+        "suspicious": "suspicious",
+        "false": "fail",
+        "wrong": "fail",
+        "incorrect": "fail",
+        "failed": "fail",
+        "fail": "fail",
+    }
+    status = status_aliases.get(raw_status)
+    if status is None:
+        correct = item.get("correct")
+        if correct is None:
+            correct = item.get("\u4e00\u81f4")
+        status = "pass" if correct is None or bool(correct) else "fail"
+    return status, status == "pass", _JUDGE_STATUS_RISK[status]
+
 
 def _format_sql_result(result: list | None, *, limit: int = 5) -> str:
     if not result:
@@ -39,6 +98,33 @@ def _format_sql_result(result: list | None, *, limit: int = 5) -> str:
     if len(result) > limit:
         lines.append(f"... 共 {len(result)} 行，仅展示前 {limit} 行")
     return "\n".join(lines)
+
+
+def _format_failed_sqls(
+    failed_sqls: list[dict] | None,
+    *,
+    sql: str,
+    execution_error: str | None,
+) -> str:
+    items = failed_sqls or [{"order": 1, "sql": sql, "error": execution_error}]
+    lines: list[str] = []
+    for idx, item in enumerate(items, start=1):
+        order = item.get("order") or idx
+        type_text = item.get("type") or ""
+        variant_id = item.get("variant_id")
+        path_text = type_text
+        if variant_id not in (None, ""):
+            path_text = f"{path_text} variant={variant_id}".strip()
+        if path_text:
+            lines.append(f"失败顺序 #{order}（{path_text}）")
+        else:
+            lines.append(f"失败顺序 #{order}")
+        lines.append("SQL:")
+        lines.append(str(item.get("sql") or ""))
+        lines.append("执行错误:")
+        lines.append(str(item.get("error") or ""))
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def parse_judge_response(text: str) -> tuple[bool, str]:
@@ -83,6 +169,124 @@ def parse_choice_response(text: str) -> tuple[int | None, str]:
     return idx, str(obj.get("原因") or obj.get("reason") or "").strip()
 
 
+def parse_batch_judge_response(text: str) -> list[dict]:
+    if not text:
+        return []
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return []
+    items = obj.get("items") if isinstance(obj, dict) else None
+    if not isinstance(items, list):
+        return []
+
+    parsed: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        status, correct, risk = _normalize_batch_judge_status(item)
+        reason = "" if correct else str(item.get("reason") or item.get("原因") or "").strip()
+        parsed.append(
+            {
+                "index": index,
+                "correct": correct,
+                "status": status,
+                "reason": reason,
+                "risk": risk,
+            }
+        )
+    return parsed
+
+
+def _format_batch_candidates(candidates: list[dict]) -> str:
+    lines: list[str] = []
+    for idx, cand in enumerate(candidates):
+        lines.append(f"候选 {idx}")
+        path_text = f"type={cand.get('type', '')}, variant={cand.get('variant_id', '')}".strip()
+        if path_text:
+            lines.append(path_text)
+        lines.append("SQL:")
+        lines.append(str(cand.get("sql") or ""))
+        error = cand.get("execution_error") or cand.get("error_msg")
+        if error:
+            lines.append("执行错误:")
+            lines.append(str(error))
+        else:
+            lines.append("执行结果预览:")
+            lines.append(_format_sql_result(cand.get("result"), limit=3))
+        probe = cand.get("value_link_probe") or {}
+        if probe.get("reasons"):
+            lines.append("事实风险信号:")
+            lines.append(json.dumps(probe, ensure_ascii=False))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def judge_sql_batch_consistency(
+    client: AsyncOpenAI,
+    model: str,
+    *,
+    question: str,
+    schema_prompt: str,
+    candidates: list[dict],
+    intent_plan: dict | None = None,
+    tracker: TokenTracker | None = None,
+) -> list[dict]:
+    """批量判断同题 SQL 是否语义正确；只给错误 SQL 返回原因。"""
+    if not candidates:
+        return []
+
+    prompt = (
+        "你是 SQL 语义审查员。请逐条判断候选 SQL 是否忠实回答用户问题。\n"
+        "审查时使用与 SQL 生成相同的 Schema、用户问题和聚合规则，但你的任务不是生成 SQL，而是判断正误。\n\n"
+        f"[Schema]\n{schema_prompt}\n\n"
+        f"[用户问题]\n{question}\n\n"
+        f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
+        f"[聚合规则]\n{aggregation_rule_text()}\n\n"
+        f"[候选SQL]\n{_format_batch_candidates(candidates)}\n\n"
+        "判断要点：\n"
+        "1. WHERE/HAVING 条件、过滤值、项目名、订单号、物料编码等必须来自用户问题原文。\n"
+        "2. SELECT 目标必须能回答用户问的对象；问供应商就查供应商，问物料类别就查类别。\n"
+        "3. 聚合函数必须遵循聚合规则，个数问题用 COUNT，明确求和问题才用 SUM。\n"
+        "4. JOIN、GROUP BY、DISTINCT、非空过滤不能改变用户问题语义。\n"
+        "5. SQL 有执行错误时直接判 fail，并在原因中简要说明。\n"
+        "输出三态 status：pass=可直接采用；suspicious=能执行但可能过宽/过窄，仅降权；fail=高置信错误，可进入修复。\n"
+        "只输出 JSON：{\"items\":[{\"index\":0,\"status\":\"pass\",\"correct\":true},{\"index\":1,\"status\":\"suspicious\",\"correct\":false,\"reason\":\"...\"},{\"index\":2,\"status\":\"fail\",\"correct\":false,\"reason\":\"...\"}]}。\n"
+        "pass 不要填写 reason；suspicious/fail 必须填写 reason。"
+    )
+    extra_body: dict = {}
+    if getattr(settings, "evidence_use_guided_json", False):
+        extra_body["guided_json"] = _BATCH_JUDGE_SCHEMA
+    if not getattr(settings, "enable_thinking_for_entity", True):
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=512,
+            timeout=settings.llm_request_timeout_sec,
+            extra_body=extra_body or None,
+        )
+        if tracker:
+            tracker.track(resp)
+        items = parse_batch_judge_response(resp.choices[0].message.content or "")
+        debug_print(f"[ConsistencyJudge][batch] items={items}")
+        return items
+    except Exception as exc:
+        debug_print(f"[ConsistencyJudge][batch] skipped: {type(exc).__name__}: {exc}")
+        return []
+
+
 async def judge_sql_consistency(
     client: AsyncOpenAI,
     model: str,
@@ -93,22 +297,40 @@ async def judge_sql_consistency(
     result: list | None,
     intent_plan: dict | None = None,
     tracker: TokenTracker | None = None,
+    execution_error: str | None = None,
+    failed_sqls: list[dict] | None = None,
 ) -> tuple[bool, str]:
     """判断可执行 SQL 的过滤/查询语义是否与问题原文一致。"""
-    prompt = (
-        "你是 SQL 语义审查员。判断给定 SQL 是否忠实使用了【用户问题】中的字面条件，"
-        "而不是偷换为 Schema 示例值或其它无关值。\n\n"
-        f"[Schema（断崖剪枝列）]\n{schema_prompt}\n\n"
-        f"[用户问题]\n{question}\n\n"
-        f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
-        f"[SQL]\n{sql}\n\n"
-        f"[SQL执行结果]\n{_format_sql_result(result)}\n\n"
-        "审查要点：\n"
-        "1. WHERE/HAVING 中的编码、单号、名称等字面量必须来自用户问题原文，不得使用 Schema 示例值替代。\n"
-        "2. SELECT 的目标列应回答用户问题（例如问「是什么/哪家」应查描述类列而非编码列）。\n"
-        "3. 若 SQL 能执行但条件与问题不一致，判定为不一致。\n"
-        "只输出 JSON：{\"一致\": true/false, \"原因\": \"...\"}\n"
-    )
+    if execution_error:
+        prompt = (
+            "你是 SQL 错误诊断员。给定 SQL 无法执行，请判断最可能的出错原因，"
+            "并给出面向 SQL 修复器的简短修复建议。\n\n"
+            f"[Schema]\n{schema_prompt}\n\n"
+            f"[用户问题]\n{question}\n\n"
+            f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
+            f"[运行失败SQL列表]\n{_format_failed_sqls(failed_sqls, sql=sql, execution_error=execution_error)}\n\n"
+            "诊断要点：\n"
+            "1. 优先判断列名、表名、聚合结构、SQL 语法是否错误。\n"
+            "2. 修复建议必须保持用户问题中的编号、单号、名称等过滤值不被替换。\n"
+            "3. 对每条失败 SQL 结合其错误信息给出可操作的修改建议。\n"
+            "4. 不要要求删除用户问题中的必要条件。\n"
+            "只输出 JSON：{\"一致\": false, \"原因\": \"...\"}\n"
+        )
+    else:
+        prompt = (
+            "你是 SQL 语义审查员。判断给定 SQL 是否忠实使用了【用户问题】中的字面条件，"
+            "而不是偷换为 Schema 示例值或其它无关值。\n\n"
+            f"[Schema（断崖剪枝列）]\n{schema_prompt}\n\n"
+            f"[用户问题]\n{question}\n\n"
+            f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
+            f"[SQL]\n{sql}\n\n"
+            f"[SQL执行结果]\n{_format_sql_result(result)}\n\n"
+            "审查要点：\n"
+            "1. WHERE/HAVING 中的编码、单号、名称等字面量必须来自用户问题原文，不得使用 Schema 示例值替代。\n"
+            "2. SELECT 的目标列应回答用户问题（例如问「是什么/哪家」应查描述类列而非编码列）。\n"
+            "3. 若 SQL 能执行但条件与问题不一致，判定为不一致。\n"
+            "只输出 JSON：{\"一致\": true/false, \"原因\": \"...\"}\n"
+        )
     extra_body: dict = {}
     if getattr(settings, "evidence_use_guided_json", False):
         extra_body["guided_json"] = _JUDGE_SCHEMA

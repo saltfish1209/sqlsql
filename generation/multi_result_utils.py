@@ -20,6 +20,10 @@ from __future__ import annotations
 # 多结果分隔符。挑了一个 Unicode 双竖线，业务数据里几乎不会出现。
 MULTI_RESULT_SEP = "‖"
 
+# 单个 SQL / Pandas 查询返回多行时的行间分隔符。
+# 不使用逗号，避免和物料描述等字段内部的英文逗号冲突。
+ROW_RESULT_SEP = "&"
+
 
 def split_answer_template_top_level(a_str: str) -> list[str]:
     """按顶层 ',' / '，' 切分回答模板，{...} 内部的逗号不切。

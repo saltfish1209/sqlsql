@@ -20,6 +20,7 @@ _PATH_PARALLEL: bool = True
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import settings
+from pipeline.consensus_vote import annotate_candidate_risk, select_by_consensus
 from pipeline.utils import TokenTracker, to_halfwidth
 
 
@@ -30,6 +31,11 @@ SUMMARY_FIELDNAMES = [
     "花费时间",
     "tokens平均消耗",
     "recall",
+    "Pass@K",
+    "selected_changed_by_refiner",
+    "judge_trigger_count",
+    "repair_success_count",
+    "repair_harm_count",
 ]
 
 # 模式1：不同 schema 构建策略对比
@@ -43,6 +49,7 @@ SCHEMA_COMPARE_CONFIGS = [
 # 模式2：主系统消融实验
 ABLATION_CONFIGS = [
     ("主系统+全量schema", "main_full_schema", "main_full_schema_recall"),
+    ("主系统", "main_system", "main_system_schema_recall"),
     ("主系统+topk截断schema", "main_topk_schema", "main_topk_schema_recall"),
     ("主系统+direct单路径", "main_direct_only", "main_direct_only_recall"),
     ("主系统+icl单路径", "main_icl_only", "main_icl_only_recall"),
@@ -108,8 +115,10 @@ def _stages_from_candidate_pack(
     question = to_halfwidth(question)
     norm_question = system._normalize_question(question)
     top20 = list(candidate_pack.Top20候选 or [])
+    cliff_rows = system.linker._rank_candidates(top20, settings.candidate_top_k)
+    cliff_schema_prompt = _build_schema_markdown(system, cliff_rows)
     if cliff:
-        schema_rows = system.linker._rank_candidates(top20, settings.candidate_top_k)
+        schema_rows = cliff_rows
         key = "cliff_schema"
     else:
         schema_rows = top20
@@ -121,6 +130,7 @@ def _stages_from_candidate_pack(
         "norm_question": norm_question,
         "candidate_pack": candidate_pack,
         key: schema_rows,
+        "cliff_schema_prompt": cliff_schema_prompt,
         "schema_prompt": schema_prompt,
         "repair_schema_prompt": repair_schema_prompt,
     }
@@ -160,6 +170,10 @@ def _default_eval_path() -> Path:
         project_root = getattr(settings, "project_root", Path(__file__).resolve().parent.parent)
         data_dir = Path(project_root) / "data"
     return Path(data_dir) / "test_split.jsonl"
+
+
+def _default_ablation_detail_path(out_dir: Path) -> Path:
+    return out_dir / "ablation_outputs.jsonl"
 
 
 def _load_eval_df(path: str | os.PathLike[str] | Path | None = None) -> list[dict]:
@@ -296,6 +310,13 @@ def _build_summary_rows(
                 "花费时间": _avg(rows, f"{prefix}_time_seconds"),
                 "tokens平均消耗": _avg(rows, f"{prefix}_total_tokens"),
                 "recall": _avg(rows, recall_key),
+                "Pass@K": _avg(rows, f"{prefix}_pass_at_k"),
+                "selected_changed_by_refiner": _sum_int(
+                    rows, f"{prefix}_selected_changed_by_refiner"
+                ),
+                "judge_trigger_count": _sum_int(rows, f"{prefix}_judge_trigger_count"),
+                "repair_success_count": _sum_int(rows, f"{prefix}_repair_success_count"),
+                "repair_harm_count": _sum_int(rows, f"{prefix}_repair_harm_count"),
             }
         )
     return summary
@@ -354,6 +375,136 @@ def _print_resume_state(group_label: str, path: Path, configs: list[tuple[str, s
     print(f"[Resume][{group_label}] pending: {pending or 'None'}")
 
 
+def _load_extra_correct_records(path: Path | None) -> dict[str, dict]:
+    if not path or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    records: dict[str, dict] = {}
+    baseline = data.get("baseline")
+    if isinstance(baseline, dict):
+        prefix = str(baseline.get("prefix") or "").strip()
+        if prefix:
+            records[prefix] = dict(baseline)
+    for item in data.get("experiments") or []:
+        prefix = str(item.get("prefix") or "").strip()
+        if prefix:
+            records[prefix] = dict(item)
+    return records
+
+
+def _correct_idx_record(
+    *,
+    label: str,
+    prefix: str,
+    rows: list[dict],
+) -> dict:
+    correct_idx = [
+        int(row.get("idx"))
+        for row in rows
+        if int(row.get(f"{prefix}_correct") or 0) == 1 and row.get("idx") not in (None, "")
+    ]
+    details_by_idx = {
+        str(int(row.get("idx"))): row["__detail__"]
+        for row in rows
+        if row.get("idx") not in (None, "") and isinstance(row.get("__detail__"), dict)
+    }
+    return {
+        "label": label,
+        "prefix": prefix,
+        "correct_count": len(correct_idx),
+        "correct_idx": correct_idx,
+        "details_by_idx": details_by_idx,
+    }
+
+
+def _build_extra_correct_report(
+    *,
+    group_label: str,
+    configs: list[tuple[str, str, str]],
+    records: dict[str, dict],
+    total_questions: int,
+) -> dict:
+    ordered = [
+        records[prefix]
+        for label, prefix, _recall_key in configs
+        if prefix in records
+    ]
+    missing = [
+        {"label": label, "prefix": prefix}
+        for label, prefix, _recall_key in configs
+        if prefix not in records
+    ]
+    use_main_system_baseline = group_label == "Ablation"
+    baseline_prefix = "main_system" if use_main_system_baseline else None
+    baseline = records.get(baseline_prefix) if baseline_prefix else None
+    if baseline is None and not use_main_system_baseline:
+        baseline = min(ordered, key=lambda item: item.get("correct_count", 0)) if ordered else None
+    baseline_correct = set(baseline.get("correct_idx") or []) if baseline else set()
+    baseline_details = baseline.get("details_by_idx") or {} if baseline else {}
+    experiments = []
+    for item in ordered:
+        correct_idx = set(item.get("correct_idx") or [])
+        extra = sorted(correct_idx - baseline_correct) if baseline else []
+        details_by_idx = item.get("details_by_idx") or {}
+        extra_details = []
+        for idx in extra:
+            idx_key = str(idx)
+            detail = details_by_idx.get(idx_key)
+            if not isinstance(detail, dict):
+                detail = {"idx": idx}
+            extra_details.append(
+                {
+                    "idx": idx,
+                    "experiment": detail,
+                    "baseline": baseline_details.get(idx_key),
+                }
+            )
+        experiments.append(
+            {
+                "label": item.get("label"),
+                "prefix": item.get("prefix"),
+                "correct_count": item.get("correct_count", 0),
+                "correct_idx": sorted(correct_idx),
+                "extra_correct_count": len(extra),
+                "extra_correct_idx": extra,
+                "extra_correct_details": extra_details,
+            }
+        )
+    return {
+        "group": group_label,
+        "total_questions": total_questions,
+        "baseline": {
+            "label": baseline.get("label"),
+            "prefix": baseline.get("prefix"),
+            "correct_count": baseline.get("correct_count", 0),
+            "correct_idx": sorted(baseline_correct),
+        } if baseline else None,
+        "experiments": experiments,
+        "missing_experiments": missing,
+    }
+
+
+def _write_extra_correct_report(
+    path: Path,
+    *,
+    group_label: str,
+    configs: list[tuple[str, str, str]],
+    records: dict[str, dict],
+    total_questions: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report = _build_extra_correct_report(
+        group_label=group_label,
+        configs=configs,
+        records=records,
+        total_questions=total_questions,
+    )
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
 def _record_metrics(
     out: dict,
     *,
@@ -363,12 +514,20 @@ def _record_metrics(
     gold_columns: list[str],
 ) -> dict:
     ok, _match = _compare_output(raw_gt, out)
+    mechanism = _mechanism_metrics(raw_gt, out)
     _in, _out, total = _tokens(out.get("token_usage"))
     return {
         f"{prefix}_correct": int(ok),
         f"{prefix}_time_seconds": round(float(out.get("cost_time") or 0.0), 6),
         f"{prefix}_total_tokens": total,
         f"{prefix}_recall": _schema_recall_value(gold_columns, recall_schema),
+        f"{prefix}_pass_at_k": mechanism["pass_at_k"],
+        f"{prefix}_selected_changed_by_refiner": mechanism[
+            "selected_changed_by_refiner"
+        ],
+        f"{prefix}_judge_trigger_count": mechanism["judge_trigger_count"],
+        f"{prefix}_repair_success_count": mechanism["repair_success_count"],
+        f"{prefix}_repair_harm_count": mechanism["repair_harm_count"],
     }
 
 
@@ -395,51 +554,8 @@ def _full_schema_prompt(system) -> str:
     return _build_schema_markdown(system, _full_schema_rows(system))
 
 
-def _build_cliff_schema_markdown(system, cliff_schema: list[dict]) -> str:
-    """仅断崖剪枝列 → 与主系统一致的富 schema markdown（不含 Must-have / 证据列）。"""
-    return _build_schema_markdown(system, cliff_schema)
-
-
-def _prepare_cliff_eval_stages(system, question: str) -> dict:
-    """系统对比路径：只做 CrossEncoder 重排序 + top-k 断崖截断，不做实体提取 / must_have 补列。"""
-    question = to_halfwidth(question)
-    norm_question = system._normalize_question(question)
-    candidate_pack = system.linker.retrieve(norm_question, [])
-    cliff_schema = system.linker._rank_candidates(
-        candidate_pack.Top20候选 or [],
-        settings.candidate_top_k,
-    )
-    schema_prompt = _build_cliff_schema_markdown(system, cliff_schema)
-    repair_schema_prompt = _build_schema_markdown(system, candidate_pack.Top20候选 or [])
-    return {
-        "question": question,
-        "norm_question": norm_question,
-        "candidate_pack": candidate_pack,
-        "cliff_schema": cliff_schema,
-        "schema_prompt": schema_prompt,
-        "repair_schema_prompt": repair_schema_prompt,
-    }
-
-
-def _prepare_topk_eval_stages(system, question: str) -> dict:
-    """CrossEncoder 重排序后的 Top20，不做断崖截断。"""
-    question = to_halfwidth(question)
-    norm_question = system._normalize_question(question)
-    candidate_pack = system.linker.retrieve(norm_question, [])
-    topk_schema = list(candidate_pack.Top20候选 or [])
-    schema_prompt = _build_schema_markdown(system, topk_schema)
-    return {
-        "question": question,
-        "norm_question": norm_question,
-        "candidate_pack": candidate_pack,
-        "topk_schema": topk_schema,
-        "schema_prompt": schema_prompt,
-        "repair_schema_prompt": schema_prompt,
-    }
-
-
 def _build_plain_schema_sql_prompt(question: str, schema_prompt: str) -> str:
-    """公平对比版：仅保留 schema markdown 与单次 SQL 生成提示。"""
+    """mode1 schema 对比：固定原始 LLM SQL prompt，仅替换 schema 内容。"""
     question = to_halfwidth(question)
     return (
         "你是一名SQL专家。请根据Schema为下列问题生成一条 SQLite SQL 查询。\n"
@@ -497,74 +613,53 @@ async def _run_full_schema_once(system, question: str, schema_prompt: str) -> di
     }
 
 
-async def _run_linked_schema_from_stages(system, stages: dict) -> dict:
-    """topk / cliff 共用：生成 + refiner + selector。"""
-    start = time.time()
-    tracker = TokenTracker()
-    candidate_pack = stages["candidate_pack"]
-    schema_prompt = stages["schema_prompt"]
+def _build_cliff_schema_markdown(system, cliff_schema: list[dict]) -> str:
+    """仅断崖剪枝列 → 与主系统一致的富 schema markdown（不含 Must-have / 证据列）。"""
+    return _build_schema_markdown(system, cliff_schema)
 
-    candidates = await system.generator.generate_candidates_async(
-        stages["question"],
-        schema_prompt,
-        tracker,
-        intent_plan=stages.get("intent_plan"),
-    )
-    if not candidates:
-        return {
-            "final_sql": None,
-            "execution_result": None,
-            "reason": "generation_failed",
-            "cost_time": time.time() - start,
-            "token_usage": tracker.get_report(),
-            "stages": stages,
-        }
 
-    confidence = (
-        float(candidate_pack.Top20候选[0]["相关性分数"])
-        if candidate_pack.Top20候选
-        else 0.0
+def _prepare_cliff_eval_stages(system, question: str) -> dict:
+    """系统对比路径：只做 CrossEncoder 重排序 + top-k 断崖截断，不做实体提取 / must_have 补列。"""
+    question = to_halfwidth(question)
+    norm_question = system._normalize_question(question)
+    candidate_pack = system.linker.retrieve(norm_question, [])
+    cliff_schema = system.linker._rank_candidates(
+        candidate_pack.Top20候选 or [],
+        settings.candidate_top_k,
     )
-    for cand in candidates:
-        cand["confidence"] = confidence
-    refined = await system.refiner.refine_async(
-        schema_prompt,
-        candidates,
-        candidate_pack.Top20候选,
-        tracker,
-        repair_schema_prompt=stages.get("repair_schema_prompt") or schema_prompt,
-    )
-    selected, reason, status = system.selector.select_best(
-        stages["question"],
-        schema_prompt,
-        refined,
-    )
-    if selected is None:
-        return {
-            "final_sql": None,
-            "execution_result": None,
-            "reason": reason,
-            "cost_time": time.time() - start,
-            "token_usage": tracker.get_report(),
-            "stages": stages,
-        }
-
-    result = selected.get("result")
-    unique_rows: list[tuple] = []
-    if result:
-        seen_rows = set()
-        for row in result:
-            tup = tuple(row)
-            if tup not in seen_rows:
-                seen_rows.add(tup)
-                unique_rows.append(tup)
+    schema_prompt = _build_cliff_schema_markdown(system, cliff_schema)
+    repair_schema_prompt = _build_schema_markdown(system, candidate_pack.Top20候选 or [])
     return {
-        "final_sql": selected.get("sql"),
-        "execution_result": unique_rows if result else result,
-        "reason": status,
-        "cost_time": time.time() - start,
-        "token_usage": tracker.get_report(),
-        "stages": stages,
+        "question": question,
+        "norm_question": norm_question,
+        "candidate_pack": candidate_pack,
+        "cliff_schema": cliff_schema,
+        "cliff_schema_prompt": schema_prompt,
+        "schema_prompt": schema_prompt,
+        "repair_schema_prompt": repair_schema_prompt,
+    }
+
+
+def _prepare_topk_eval_stages(system, question: str) -> dict:
+    """CrossEncoder 重排序后的 Top20，不做断崖截断。"""
+    question = to_halfwidth(question)
+    norm_question = system._normalize_question(question)
+    candidate_pack = system.linker.retrieve(norm_question, [])
+    topk_schema = list(candidate_pack.Top20候选 or [])
+    cliff_schema = system.linker._rank_candidates(
+        candidate_pack.Top20候选 or [],
+        settings.candidate_top_k,
+    )
+    cliff_schema_prompt = _build_schema_markdown(system, cliff_schema)
+    schema_prompt = _build_schema_markdown(system, topk_schema)
+    return {
+        "question": question,
+        "norm_question": norm_question,
+        "candidate_pack": candidate_pack,
+        "topk_schema": topk_schema,
+        "cliff_schema_prompt": cliff_schema_prompt,
+        "schema_prompt": schema_prompt,
+        "repair_schema_prompt": schema_prompt,
     }
 
 
@@ -598,15 +693,17 @@ def _prepare_main_no_entity_stages(system, question: str) -> dict:
         "candidate_pack": candidate_pack,
         "plan_schema": plan_schema,
         "final_schema": final_schema,
+        "cliff_schema_prompt": schema_prompt,
         "schema_prompt": schema_prompt,
         "repair_schema_prompt": repair_schema_prompt,
     }
 
 
-def _prepare_candidate_for_selector(system, cand: dict) -> dict:
-    """无 refiner 时：执行 SQL 并补齐 selector 所需的 status / result 字段。"""
+def _prepare_candidate_for_vote(system, cand: dict) -> dict:
+    """无 refiner 时：执行 SQL 并补齐一致性投票所需的 status / result 字段。"""
     prepared = dict(cand)
     result, error = system.db_engine.execute_sql(prepared.get("sql") or "")
+    prepared["execution_error"] = error
     if error is not None:
         prepared["status"] = "failed"
         prepared["result"] = None
@@ -614,7 +711,106 @@ def _prepare_candidate_for_selector(system, cand: dict) -> dict:
     else:
         prepared["status"] = "success"
         prepared["result"] = result if result is not None else []
+    annotate_candidate_risk(prepared, system.db_engine.check_literal_in_column)
     return prepared
+
+
+def _preview_result(result, *, limit: int = 5):
+    if result is None:
+        return None
+    preview = []
+    for row in (result or [])[:limit]:
+        if isinstance(row, tuple):
+            preview.append(list(row))
+        else:
+            preview.append(row)
+    return preview
+
+
+def _candidate_path_record(candidate: dict) -> dict:
+    debug = candidate.get("refiner_debug") or {}
+    refiner_debug = debug.get("refiner") or {}
+    judge_debug = debug.get("judge") or {"ran": False, "reason": ""}
+    sql_before = refiner_debug.get("sql_before", candidate.get("sql"))
+    return {
+        "type": candidate.get("type"),
+        "variant_id": candidate.get("variant_id"),
+        "sql_before": sql_before,
+        "sql_after": candidate.get("sql"),
+        "sql": candidate.get("sql"),
+        "status": candidate.get("status"),
+        "execution_error": candidate.get("execution_error"),
+        "error_msg": candidate.get("error_msg"),
+        "result_preview": _preview_result(candidate.get("result")),
+        "judge_status": candidate.get("judge_status"),
+        "judge_risk": candidate.get("judge_risk"),
+        "judge_reason": candidate.get("judge_reason"),
+        "post_repair_judge_status": candidate.get("post_repair_judge_status"),
+        "post_repair_judge_risk": candidate.get("post_repair_judge_risk"),
+        "post_repair_judge_reason": candidate.get("post_repair_judge_reason"),
+        "value_link_risk": candidate.get("value_link_risk"),
+        "value_link_probe": candidate.get("value_link_probe") or {},
+        "is_refined": bool(candidate.get("is_refined")),
+        "refined_from": candidate.get("refined_from"),
+        "refiner_round": candidate.get("refiner_round"),
+        "source_sql": candidate.get("source_sql"),
+        "repair_changed": candidate.get("repair_changed"),
+        "judge_debug": judge_debug,
+        "refiner_debug": refiner_debug,
+    }
+
+
+def _generated_candidate_record(candidate: dict) -> dict:
+    return {
+        "type": candidate.get("type"),
+        "variant_id": candidate.get("variant_id"),
+        "sql": candidate.get("sql"),
+    }
+
+
+def _pipeline_trace_fields(
+    generated_candidates: list[dict],
+    candidates: list[dict],
+    selected: dict | None,
+) -> dict:
+    candidate_results = [
+        {
+            "type": item.get("type"),
+            "variant_id": item.get("variant_id"),
+            "status": item.get("status"),
+            "execution_error": item.get("execution_error"),
+            "result_preview": _preview_result(item.get("result")),
+            "judge_status": item.get("judge_status"),
+            "judge_risk": item.get("judge_risk"),
+            "value_link_risk": item.get("value_link_risk"),
+            "is_refined": bool(item.get("is_refined")),
+            "refined_from": item.get("refined_from"),
+        }
+        for item in candidates
+    ]
+    return {
+        "generated_candidates": [_generated_candidate_record(item) for item in generated_candidates],
+        "refined_candidates": [_candidate_path_record(item) for item in candidates],
+        "selected_candidate": _candidate_path_record(selected) if selected else None,
+        "candidate_results": candidate_results,
+        "candidate_sqls": [
+            {
+                "type": item.get("type"),
+                "variant_id": item.get("variant_id"),
+                "sql": item.get("sql"),
+                "status": item.get("status"),
+                "judge_status": item.get("judge_status"),
+                "judge_risk": item.get("judge_risk"),
+                "value_link_risk": item.get("value_link_risk"),
+                "is_refined": bool(item.get("is_refined")),
+                "refined_from": item.get("refined_from"),
+            }
+            for item in candidates
+        ],
+        "_candidate_pool": candidates,
+        "_selected_candidate": selected,
+        "_generated_candidate_count": len(generated_candidates),
+    }
 
 
 async def _run_main_no_entity_once(system, question: str) -> dict:
@@ -655,13 +851,13 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
         candidate_pack.Top20候选,
         tracker,
         repair_schema_prompt=repair_schema_prompt,
+        question=stages["question"],
+        judge_schema_prompt=stages.get("cliff_schema_prompt") or schema_prompt,
+        intent_plan=stages.get("intent_plan"),
     )
-    selected, reason, status = system.selector.select_best(
-        stages["question"],
-        schema_prompt,
-        refined,
-    )
+    selected, reason, status = select_by_consensus(refined)
     if selected is None:
+        trace_fields = _pipeline_trace_fields(candidates, refined, None)
         return {
             "final_sql": None,
             "execution_result": None,
@@ -669,6 +865,7 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
             "cost_time": time.time() - start,
             "token_usage": tracker.get_report(),
             "stages": stages,
+            **trace_fields,
         }
 
     result = selected.get("result")
@@ -680,6 +877,7 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
             if tup not in seen_rows:
                 seen_rows.add(tup)
                 unique_rows.append(tup)
+    trace_fields = _pipeline_trace_fields(candidates, refined, selected)
     return {
         "final_sql": selected.get("sql"),
         "execution_result": unique_rows if result else result,
@@ -687,6 +885,7 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
         "cost_time": time.time() - start,
         "token_usage": tracker.get_report(),
         "stages": stages,
+        **trace_fields,
     }
 
 
@@ -723,13 +922,10 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
     prepared = []
     for cand in candidates:
         cand["confidence"] = confidence
-        prepared.append(_prepare_candidate_for_selector(system, cand))
-    selected, reason, status = system.selector.select_best(
-        stages["question"],
-        schema_prompt,
-        prepared,
-    )
+        prepared.append(_prepare_candidate_for_vote(system, cand))
+    selected, reason, status = select_by_consensus(prepared)
     if selected is None:
+        trace_fields = _pipeline_trace_fields(candidates, prepared, None)
         return {
             "final_sql": None,
             "execution_result": None,
@@ -737,6 +933,7 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
             "cost_time": time.time() - start,
             "token_usage": tracker.get_report(),
             "stages": stages,
+            **trace_fields,
         }
 
     result = selected.get("result")
@@ -748,6 +945,7 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
             if tup not in seen_rows:
                 seen_rows.add(tup)
                 unique_rows.append(tup)
+    trace_fields = _pipeline_trace_fields(candidates, prepared, selected)
     return {
         "final_sql": selected.get("sql"),
         "execution_result": unique_rows if result else result,
@@ -755,6 +953,7 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
         "cost_time": time.time() - start,
         "token_usage": tracker.get_report(),
         "stages": stages,
+        **trace_fields,
     }
 
 
@@ -818,6 +1017,11 @@ async def _finalize_main_pipeline(
             "cost_time": time.time() - start,
             "token_usage": tracker.get_report(),
             "stages": stages,
+            "generated_candidates": [],
+            "refined_candidates": [],
+            "selected_candidate": None,
+            "candidate_results": [],
+            "candidate_sqls": [],
         }
 
     generated_candidates = cand if isinstance(cand, list) else [cand]
@@ -829,7 +1033,7 @@ async def _finalize_main_pipeline(
     for item in generated_candidates:
         item["confidence"] = confidence
     if skip_refiner:
-        candidates = [_prepare_candidate_for_selector(system, item) for item in generated_candidates]
+        candidates = [_prepare_candidate_for_vote(system, item) for item in generated_candidates]
     else:
         candidates = await system.refiner.refine_async(
             schema_prompt,
@@ -837,9 +1041,13 @@ async def _finalize_main_pipeline(
             candidate_pack.Top20候选,
             tracker,
             repair_schema_prompt=repair_schema_prompt,
+            question=question if not skip_judge else None,
+            judge_schema_prompt=cliff_schema_prompt,
+            intent_plan=stages.get("intent_plan"),
         )
-    selected, reason, status = system.selector.select_best(question, schema_prompt, candidates)
+    selected, reason, status = select_by_consensus(candidates)
     if selected is None:
+        trace_fields = _pipeline_trace_fields(generated_candidates, candidates, None)
         return {
             "final_sql": None,
             "execution_result": None,
@@ -847,6 +1055,7 @@ async def _finalize_main_pipeline(
             "cost_time": time.time() - start,
             "token_usage": tracker.get_report(),
             "stages": stages,
+            **trace_fields,
         }
 
     result = selected.get("result")
@@ -859,45 +1068,7 @@ async def _finalize_main_pipeline(
                 seen_rows.add(tup)
                 unique_rows.append(tup)
 
-    if (
-        not skip_judge
-        and selected.get("status") == "success"
-        and settings.enable_sql_consistency_judge
-        and selected.get("sql")
-    ):
-        from pipeline.sql_consistency_judge import judge_sql_consistency
-
-        consistent, judge_reason = await judge_sql_consistency(
-            system.client,
-            system.llm_model,
-            question=question,
-            schema_prompt=cliff_schema_prompt,
-            sql=str(selected.get("sql") or ""),
-            result=unique_rows if result else result,
-            intent_plan=stages.get("intent_plan"),
-            tracker=tracker,
-        )
-        if not consistent:
-            repaired = await system.refiner.repair_semantic_async(
-                cliff_schema_prompt,
-                selected,
-                question=question,
-                tracker=tracker,
-                judge_reason=judge_reason,
-            )
-            if repaired.get("status") == "success":
-                selected = repaired
-                result = selected.get("result")
-                unique_rows = []
-                if result:
-                    seen_rows = set()
-                    for row in result:
-                        tup = tuple(row)
-                        if tup not in seen_rows:
-                            seen_rows.add(tup)
-                            unique_rows.append(tup)
-                status = "semantic_repaired"
-
+    trace_fields = _pipeline_trace_fields(generated_candidates, candidates, selected)
     return {
         "final_sql": selected.get("sql"),
         "execution_result": unique_rows if result else result,
@@ -905,6 +1076,7 @@ async def _finalize_main_pipeline(
         "cost_time": time.time() - start,
         "token_usage": tracker.get_report(),
         "stages": stages,
+        **trace_fields,
     }
 
 
@@ -1018,7 +1190,7 @@ async def _run_main_single_path_once(
 
 
 async def _run_main_no_judge_once(system, question: str, *, stages: dict | None = None) -> dict:
-    """完整主系统，但跳过 LLM consistency judge，保留 refiner + selector 一致性投票。"""
+    """完整主系统，但跳过 LLM consistency judge，保留 refiner + 简单一致性投票。"""
     start = time.time()
     tracker = TokenTracker()
     if stages is None:
@@ -1049,6 +1221,12 @@ async def _run_main_no_judge_once(system, question: str, *, stages: dict | None 
     )
 
 
+def _normalize_eval_execution_result(result):
+    from training.evaluate import normalize_execution_result
+
+    return normalize_execution_result(result)
+
+
 def _compare_output(raw_gt: Any, output: dict) -> tuple[bool, str]:
     from training.evaluate import _compare_results, normalize_execution_result, parse_ground_truth
 
@@ -1058,6 +1236,100 @@ def _compare_output(raw_gt: Any, output: dict) -> tuple[bool, str]:
     return bool(ok), str(match_type)
 
 
+def _candidate_match(raw_gt: Any, candidate: dict) -> tuple[bool, str]:
+    return _compare_output(raw_gt, {"execution_result": candidate.get("result")})
+
+
+def _mechanism_metrics(raw_gt: Any, output: dict) -> dict:
+    candidates = output.get("_candidate_pool") or []
+    if not candidates:
+        selected_ok, _match_type = _compare_output(raw_gt, output)
+        return {
+            "pass_at_k": int(selected_ok),
+            "selected_changed_by_refiner": 0,
+            "judge_trigger_count": 0,
+            "repair_success_count": 0,
+            "repair_harm_count": 0,
+        }
+
+    candidate_hits = [_candidate_match(raw_gt, item)[0] for item in candidates]
+    selected = output.get("_selected_candidate") or {}
+    selected_changed = bool(
+        selected.get("is_refined")
+        and selected.get("source_sql")
+        and str(selected.get("source_sql")).strip() != str(selected.get("sql") or "").strip()
+    )
+    judge_trigger_count = sum(
+        1
+        for item in candidates
+        if not item.get("is_refined") and item.get("judge_status") == "fail"
+    )
+    repair_success_count = 0
+    repair_harm_count = 0
+    for idx, item in enumerate(candidates):
+        if not item.get("is_refined"):
+            continue
+        source_idx = item.get("refined_from")
+        if not isinstance(source_idx, int) or source_idx < 0 or source_idx >= len(candidates):
+            continue
+        source_hit = candidate_hits[source_idx]
+        repaired_hit = candidate_hits[idx]
+        repair_success_count += int(repaired_hit and not source_hit)
+        repair_harm_count += int(source_hit and not repaired_hit)
+
+    return {
+        "pass_at_k": int(any(candidate_hits)),
+        "selected_changed_by_refiner": int(selected_changed),
+        "judge_trigger_count": judge_trigger_count,
+        "repair_success_count": repair_success_count,
+        "repair_harm_count": repair_harm_count,
+    }
+
+
+def _detail_trace_fields(raw_gt: Any, output: dict) -> dict:
+    candidates = output.get("_candidate_pool") or []
+    candidate_matches = [
+        {"candidate_correct": ok, "candidate_match_type": match_type}
+        for ok, match_type in (_candidate_match(raw_gt, item) for item in candidates)
+    ]
+
+    def _enrich(records: list[dict], *, limit: int | None = None) -> list[dict]:
+        enriched = []
+        for idx, record in enumerate(records[:limit] if limit is not None else records):
+            item = dict(record)
+            if idx < len(candidate_matches):
+                item.update(candidate_matches[idx])
+            enriched.append(item)
+        return enriched
+
+    generated = output.get("generated_candidates") or []
+    refined = output.get("refined_candidates") or []
+    candidate_results = output.get("candidate_results") or []
+    selected_record = output.get("selected_candidate")
+    selected = output.get("_selected_candidate")
+    if isinstance(selected_record, dict):
+        selected_record = dict(selected_record)
+        if isinstance(selected, dict):
+            ok, match_type = _candidate_match(raw_gt, selected)
+            selected_record.update(
+                {"candidate_correct": ok, "candidate_match_type": match_type}
+            )
+
+    mechanism = _mechanism_metrics(raw_gt, output)
+    return {
+        "generated_candidates": _enrich(
+            generated,
+            limit=int(output.get("_generated_candidate_count") or len(generated)),
+        ),
+        "refined_candidates": _enrich(refined),
+        "selected_candidate": selected_record,
+        "candidate_results": _enrich(candidate_results),
+        "candidate_pool_has_correct_sql": bool(mechanism["pass_at_k"]),
+        "selected_from_refiner": bool(selected and selected.get("is_refined")),
+        **mechanism,
+    }
+
+
 def _build_main_system_detail_record(
     *,
     idx: int,
@@ -1065,10 +1337,11 @@ def _build_main_system_detail_record(
     raw_gt: Any,
     output: dict,
 ) -> dict:
-    from training.evaluate import normalize_execution_result, parse_ground_truth
+    from training.evaluate import parse_ground_truth
 
     ok, match_type = _compare_output(raw_gt, output)
     stages = output.get("stages") or {}
+    trace_fields = _detail_trace_fields(raw_gt, output)
     return {
         "idx": idx,
         "question": question,
@@ -1076,16 +1349,47 @@ def _build_main_system_detail_record(
         "ground_truth_parsed": parse_ground_truth(raw_gt),
         "final_sql": output.get("final_sql"),
         "final_result": output.get("execution_result"),
-        "final_result_parsed": normalize_execution_result(output.get("execution_result")),
+        "final_result_parsed": _normalize_eval_execution_result(output.get("execution_result")),
         "correct": ok,
         "match_type": match_type,
         "reason": output.get("reason"),
         "cost_time": output.get("cost_time"),
         "token_usage": output.get("token_usage") or {},
         "candidate_sqls": output.get("candidate_sqls") or [],
+        **trace_fields,
         "intent_plan": output.get("intent_plan") or stages.get("intent_plan") or {},
         "plan_schema": stages.get("plan_schema") or [],
         "repair_schema": output.get("repair_schema") or stages.get("final_schema") or [],
+    }
+
+
+def _build_experiment_detail_record(
+    *,
+    idx: int,
+    label: str,
+    prefix: str,
+    question: str,
+    raw_gt: Any,
+    output: dict,
+) -> dict:
+    ok, match_type = _compare_output(raw_gt, output)
+    trace_fields = _detail_trace_fields(raw_gt, output)
+    return {
+        "idx": idx,
+        "label": label,
+        "prefix": prefix,
+        "question": question,
+        "ground_truth_raw": raw_gt,
+        "final_sql": output.get("final_sql"),
+        "final_result": output.get("execution_result"),
+        "final_result_parsed": _normalize_eval_execution_result(output.get("execution_result")),
+        "correct": ok,
+        "match_type": match_type,
+        "reason": output.get("reason"),
+        "cost_time": output.get("cost_time"),
+        "token_usage": output.get("token_usage") or {},
+        "candidate_sqls": output.get("candidate_sqls") or [],
+        **trace_fields,
     }
 
 
@@ -1180,6 +1484,7 @@ async def _run_ablation_one(
 
     (
         main_full_output,
+        main_output,
         main_topk_output,
         main_direct_output,
         main_icl_output,
@@ -1196,6 +1501,7 @@ async def _run_ablation_one(
                 full_schema_row_list,
                 stages=main_stages,
             ),
+            lambda: _run_main_system_once(system, question, stages=main_stages),
             lambda: _run_main_with_schema_once(
                 system,
                 question,
@@ -1221,6 +1527,16 @@ async def _run_ablation_one(
             gold_columns=gold_columns,
         )
     )
+    metrics.update(
+        _record_metrics(
+            main_output,
+            prefix="main_system",
+            raw_gt=raw_gt,
+            recall_schema=main_stages.get("plan_schema") or [],
+            gold_columns=gold_columns,
+        )
+    )
+    metrics["main_system_schema_recall"] = metrics.pop("main_system_recall")
     metrics.update(
         _record_metrics(
             main_topk_output,
@@ -1338,12 +1654,14 @@ async def _run_schema_compare_config_one(
         )
     )
     if prefix == "main_system":
-        metrics["__detail__"] = _build_main_system_detail_record(
+        detail = _build_main_system_detail_record(
             idx=idx,
             question=question,
             raw_gt=raw_gt,
             output=output,
         )
+        if not detail.get("correct"):
+            metrics["__detail__"] = detail
     _normalize_recall_key(metrics, prefix, recall_key)
     return metrics
 
@@ -1356,7 +1674,7 @@ async def _run_ablation_config_one(
     full_schema_prompt: str,
     config: tuple[str, str, str],
 ) -> dict:
-    _label, prefix, recall_key = config
+    label, prefix, recall_key = config
     question = str(row.get("生成问题") or "").strip()
     raw_gt = row.get("生成结果")
     gold_columns = _gold_columns_from_row(row, system.linker.column_names)
@@ -1373,6 +1691,10 @@ async def _run_ablation_config_one(
             stages=stages,
         )
         recall_schema = full_schema_row_list
+    elif prefix == "main_system":
+        stages = await _prepare_single_pipeline_async(system, question)
+        output = await _run_main_system_once(system, question, stages=stages)
+        recall_schema = stages.get("plan_schema") or []
     elif prefix == "main_topk_schema":
         stages = await _prepare_single_pipeline_async(system, question)
         topk_stages = _stages_from_candidate_pack(
@@ -1423,6 +1745,14 @@ async def _run_ablation_config_one(
             recall_schema=recall_schema,
             gold_columns=gold_columns,
         )
+    )
+    metrics["__detail__"] = _build_experiment_detail_record(
+        idx=idx,
+        label=label,
+        prefix=prefix,
+        question=question,
+        raw_gt=raw_gt,
+        output=output,
     )
     _normalize_recall_key(metrics, prefix, recall_key)
     return metrics
@@ -1501,12 +1831,14 @@ async def _run_config_group_with_resume(
     configs: list[tuple[str, str, str]],
     output_path: Path,
     detail_output_path: Path | None,
+    extra_correct_path: Path | None,
     runner,
     label: str,
     concurrency: int,
 ) -> list[dict]:
     _print_resume_state(label, output_path, configs)
     completed = _completed_labels(output_path)
+    extra_records = _load_extra_correct_records(extra_correct_path)
 
     for config in configs:
         experiment_label, prefix, _recall_key = config
@@ -1528,9 +1860,30 @@ async def _run_config_group_with_resume(
             _append_jsonl_rows(detail_output_path, detail_rows)
         summary_row = _build_summary_rows(rows, [config])[0]
         _append_csv_row(output_path, summary_row, SUMMARY_FIELDNAMES)
+        extra_records[prefix] = _correct_idx_record(
+            label=experiment_label,
+            prefix=prefix,
+            rows=rows,
+        )
+        if extra_correct_path:
+            _write_extra_correct_report(
+                extra_correct_path,
+                group_label=label,
+                configs=configs,
+                records=extra_records,
+                total_questions=len(eval_rows),
+            )
         completed.add(experiment_label)
         print(f"[Resume][{label}] saved: {experiment_label} ({prefix}) -> {output_path}")
 
+    if extra_correct_path:
+        _write_extra_correct_report(
+            extra_correct_path,
+            group_label=label,
+            configs=configs,
+            records=extra_records,
+            total_questions=len(eval_rows),
+        )
     return _read_csv_rows(output_path)
 
 
@@ -1561,6 +1914,13 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.main_system_detail_output
         else out_dir / "main_system_outputs.jsonl"
     )
+    ablation_detail_path = (
+        Path(args.ablation_detail_output)
+        if args.ablation_detail_output
+        else _default_ablation_detail_path(out_dir)
+    )
+    schema_extra_correct_path = out_dir / "schema_compare_extra_correct.json"
+    ablation_extra_correct_path = out_dir / "ablation_extra_correct.json"
     if args.overwrite:
         if mode in {"1", "both"} and schema_compare_path.exists():
             schema_compare_path.unlink()
@@ -1571,6 +1931,15 @@ async def main_async(args: argparse.Namespace) -> None:
         if mode in {"1", "both"} and main_system_detail_path.exists():
             main_system_detail_path.unlink()
             print(f"[Overwrite] removed: {main_system_detail_path}")
+        if mode in {"1", "both"} and schema_extra_correct_path.exists():
+            schema_extra_correct_path.unlink()
+            print(f"[Overwrite] removed: {schema_extra_correct_path}")
+        if mode in {"2", "both"} and ablation_extra_correct_path.exists():
+            ablation_extra_correct_path.unlink()
+            print(f"[Overwrite] removed: {ablation_extra_correct_path}")
+        if mode in {"2", "both"} and ablation_detail_path.exists():
+            ablation_detail_path.unlink()
+            print(f"[Overwrite] removed: {ablation_detail_path}")
 
     global _PATH_PARALLEL
     _PATH_PARALLEL = not bool(args.no_path_parallel)
@@ -1597,15 +1966,18 @@ async def main_async(args: argparse.Namespace) -> None:
             configs=SCHEMA_COMPARE_CONFIGS,
             output_path=schema_compare_path,
             detail_output_path=main_system_detail_path,
+            extra_correct_path=schema_extra_correct_path,
             runner=_run_schema_compare_config_one,
             label="SchemaCompare",
             concurrency=concurrency,
         )
         report["schema_compare_summary"] = schema_summary
         report["schema_compare_csv"] = str(schema_compare_path)
+        report["schema_compare_extra_correct_json"] = str(schema_extra_correct_path)
         if main_system_detail_path.exists():
             report["main_system_detail_jsonl"] = str(main_system_detail_path)
         print(f"schema compare summary CSV: {schema_compare_path}")
+        print(f"schema compare extra-correct JSON: {schema_extra_correct_path}")
 
     if mode in {"2", "both"}:
         ablation_summary = await _run_config_group_with_resume(
@@ -1614,14 +1986,19 @@ async def main_async(args: argparse.Namespace) -> None:
             full_schema_prompt=full_prompt,
             configs=ABLATION_CONFIGS,
             output_path=ablation_path,
-            detail_output_path=None,
+            detail_output_path=ablation_detail_path,
+            extra_correct_path=ablation_extra_correct_path,
             runner=_run_ablation_config_one,
             label="Ablation",
             concurrency=concurrency,
         )
         report["ablation_summary"] = ablation_summary
         report["ablation_csv"] = str(ablation_path)
+        report["ablation_detail_jsonl"] = str(ablation_detail_path)
+        report["ablation_extra_correct_json"] = str(ablation_extra_correct_path)
         print(f"ablation summary CSV: {ablation_path}")
+        print(f"ablation detail JSONL: {ablation_detail_path}")
+        print(f"ablation extra-correct JSON: {ablation_extra_correct_path}")
 
     report["elapsed_seconds"] = round(time.time() - start, 6)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1665,6 +2042,11 @@ def main() -> None:
         "--main-system-detail-output",
         default="",
         help="主系统逐题 JSONL 日志路径，默认 tests/results/main_system_outputs.jsonl",
+    )
+    parser.add_argument(
+        "--ablation-detail-output",
+        default="",
+        help="模式2逐题 JSONL 日志路径，默认 tests/results/ablation_outputs.jsonl",
     )
     parser.add_argument(
         "--overwrite",

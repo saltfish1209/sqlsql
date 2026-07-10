@@ -16,9 +16,8 @@ from pipeline.llm_client import create_async_client, get_model_name
 from pipeline.profiler import DatabaseProfiler, apply_instance_fields
 from pipeline.question_splitter import QuestionSplitter
 from pipeline.refiner import SQLRefiner
-from pipeline.selector import SQLSelector
 from pipeline.schema_format import build_light_schema_markdown, build_plan_markdown, enrich_schema_columns
-from pipeline.sql_consistency_judge import choose_sql_candidate, judge_sql_consistency
+from pipeline.consensus_vote import select_by_consensus
 from pipeline.utils import TokenTracker, debug_print, to_halfwidth
 
 
@@ -46,7 +45,6 @@ class TextToSQLSystem:
         self.generator = SQLGenerator(self.client, self.llm_model)
         self.splitter = QuestionSplitter(self.client, self.llm_model)
         self.refiner = SQLRefiner(self.client, self.llm_model, self.db_engine)
-        self.selector = SQLSelector()
         self.profiler = DatabaseProfiler(csv_path=csv_path)
         debug_print(">>> [System Init] 完成.\n")
 
@@ -103,27 +101,11 @@ class TextToSQLSystem:
             candidate_pack.Top20候选,
             tracker,
             repair_schema_prompt=repair_schema_prompt,
+            question=question,
+            judge_schema_prompt=cliff_schema_prompt,
+            intent_plan=intent_plan,
         )
-        selected, reason, status = self.selector.select_best(question, schema_prompt, refined)
-        scored = self.selector.score_candidates(refined)
-        if (
-            status == "success"
-            and settings.enable_sql_consistency_judge
-            and len(scored) >= 2
-            and scored[0]["score"] - scored[1]["score"] <= self.selector.tie_margin
-        ):
-            tie_candidates = [item["candidate"] for item in scored[:2]]
-            chosen_idx, choice_reason = await choose_sql_candidate(
-                self.client,
-                self.llm_model,
-                question=question,
-                intent_plan=intent_plan,
-                candidates=tie_candidates,
-                tracker=tracker,
-            )
-            if chosen_idx is not None:
-                selected = tie_candidates[chosen_idx]
-                reason = f"llm_tiebreak: {choice_reason or chosen_idx}"
+        selected, reason, status = select_by_consensus(refined)
         if selected is None:
             return {
                 "final_sql": None,
@@ -154,46 +136,6 @@ class TextToSQLSystem:
                     continue
                 seen_rows.add(tup)
                 unique_rows.append(tup)
-
-        if (
-            selected.get("status") == "success"
-            and settings.enable_sql_consistency_judge
-            and selected.get("sql")
-        ):
-            consistent, judge_reason = await judge_sql_consistency(
-                self.client,
-                self.llm_model,
-                question=question,
-                schema_prompt=cliff_schema_prompt,
-                sql=str(selected.get("sql") or ""),
-                result=unique_rows if result else result,
-                intent_plan=intent_plan,
-                tracker=tracker,
-            )
-            if not consistent:
-                repaired = await self.refiner.repair_semantic_async(
-                    cliff_schema_prompt,
-                    selected,
-                    question=question,
-                    tracker=tracker,
-                    judge_reason=judge_reason,
-                )
-                if repaired.get("status") == "success":
-                    selected = repaired
-                    result = selected.get("result")
-                    unique_rows = []
-                    if result:
-                        seen_rows = set()
-                        for row in result:
-                            if row is None:
-                                continue
-                            tup = tuple(row)
-                            if tup in seen_rows:
-                                continue
-                            seen_rows.add(tup)
-                            unique_rows.append(tup)
-                    status = "semantic_repaired"
-                    reason = judge_reason or "semantic_repaired"
 
         return {
             "final_sql": selected.get("sql"),
@@ -415,8 +357,8 @@ def print_debug_refiner_trace(refined_candidates: list[dict]) -> None:
         refiner_debug = cand.get("refiner_debug")
         if not refiner_debug:
             continue
-        print("\n[check]")
-        print(_pretty(refiner_debug.get("check")))
+        print("\n[judge]")
+        print(_pretty(refiner_debug.get("judge")))
         print("\n[refiner]")
         print(_pretty(refiner_debug.get("refiner")))
         return
@@ -498,11 +440,12 @@ if __name__ == "__main__":
                 pack.Top20候选,
                 tracker,
                 repair_schema_prompt=repair_schema_prompt,
+                question=stages["question"],
+                judge_schema_prompt=stages.get("cliff_schema_prompt") or schema_prompt,
+                intent_plan=stages.get("intent_plan"),
             )
 
-        selected, reason, status = system.selector.select_best(
-            stages["question"], schema_prompt, refined
-        ) if refined else (None, "no_candidates", "failed")
+        selected, reason, status = select_by_consensus(refined) if refined else (None, "no_candidates", "failed")
 
         output = await system.run_pipeline_async(sample_question)
 

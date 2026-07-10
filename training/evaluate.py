@@ -22,6 +22,7 @@ sys.path.insert(0, str(os.path.normpath(os.path.join(os.path.dirname(__file__), 
 from config.settings import settings
 from generation.multi_result_utils import (
     MULTI_RESULT_SEP,
+    ROW_RESULT_SEP,
     split_multi_result_string,
 )
 from training.template_split import split_dataframe_by_template
@@ -37,7 +38,7 @@ def is_float(s):
 
 def normalize_value(val):
     """统一返回字符串：避免 GT/Pred 一边是 float 一边是 str 的类型假阴性。"""
-    s = str(val).strip()
+    s = re.sub(r"\s+", "", str(val).strip())
     if is_float(s):
         f = round(float(s), 2)
         # 与 SQL 端 ROUND(x, 2) 行为对齐：整数显示为 '1000' 而非 '1000.0'
@@ -77,8 +78,14 @@ def _parse_single_gt(gt_str: str) -> set:
                 collected.append("|".join(cells))
             return {normalize_value(v) for v in collected if v}
 
-    # —— 标准形态：行间中文逗号 / 分号 ——
-    rows = re.split(r"[，；;]", gt_str)
+    # —— 新标准形态：行间 ROW_RESULT_SEP；中文逗号 / 分号仍作为旧标准兼容。
+    # 英文逗号可能是物料描述内部字符，不能在解析阶段直接拆；
+    # 旧数据把多行答案拼成英文逗号时，由 _compare_results 做精确匹配兜底。
+    rows = (
+        gt_str.split(ROW_RESULT_SEP)
+        if ROW_RESULT_SEP in gt_str
+        else re.split(r"[，；;]", gt_str)
+    )
     out = set()
     for row in rows:
         row = row.strip()
@@ -123,6 +130,21 @@ def _normalize_single_result(result) -> set:
     return out
 
 
+def _split_row_result_sep(parsed):
+    if isinstance(parsed, list):
+        return [_split_row_result_sep(item) for item in parsed]
+    if not isinstance(parsed, set):
+        return parsed
+
+    out: set[str] = set()
+    for item in parsed:
+        for part in str(item).split(ROW_RESULT_SEP):
+            part = part.strip()
+            if part:
+                out.add(part)
+    return out
+
+
 def _is_multi_result_payload(result) -> bool:
     """判断 pipeline 返回的 execution_result 是否是多子问题 (list[list[tuple]])。"""
     if not isinstance(result, list) or not result:
@@ -144,8 +166,8 @@ def normalize_execution_result(result):
       - 多结果 → ``list[set[str]]``（pipeline 在多问题模式下会返回 ``list[list[tuple]]``）
     """
     if _is_multi_result_payload(result):
-        return [_normalize_single_result(sub) for sub in result]
-    return _normalize_single_result(result)
+        return _split_row_result_sep([_normalize_single_result(sub) for sub in result])
+    return _split_row_result_sep(_normalize_single_result(result))
 
 
 def _name_only_set(s: set[str]) -> set[str]:
@@ -157,6 +179,17 @@ def _name_only_set(s: set[str]) -> set[str]:
             continue
         out.add(text.split("|", 1)[0].strip())
     return out
+
+
+def _legacy_comma_list_set(s: set[str]) -> set[str]:
+    """旧答案用英文逗号拼多行时，比较阶段再拆；不改变标准解析形态。"""
+    if len(s) != 1:
+        return set()
+    item = next(iter(s)).strip()
+    if "|" in item or "," not in item:
+        return set()
+    parts = [normalize_value(x) for x in item.split(",") if normalize_value(x)]
+    return set(parts) if len(parts) > 1 else set()
 
 
 def _flatten_result_cells(parsed) -> set[str]:
@@ -196,6 +229,10 @@ def _compare_results(gt, pred) -> tuple[bool, float, str]:
 
     if gt == pred:
         return True, 1.0, "full"
+
+    legacy_gt = _legacy_comma_list_set(gt)
+    if legacy_gt and legacy_gt == pred:
+        return True, 1.0, "legacy_comma_list"
 
     if gt and pred and _name_only_set(gt) == _name_only_set(pred):
         return False, 0.7, "name_only"
