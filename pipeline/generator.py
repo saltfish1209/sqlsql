@@ -96,8 +96,9 @@ class SQLGenerator:
             "2. WHERE/HAVING 中的编码、单号、名称等过滤值必须来自用户问题原文，"
             "严禁使用 Schema 示例值、枚举值或范围值替代问题字面量。\n"
             "3. 业务编码/单号列请优先使用带引号的文本字面量，例如 `\"物料编码\" = '500138627'`。\n"
-            "4. 结果存在重复值时，优先考虑 DISTINCT。\n"
-            "5. 只输出 JSON，不要输出 Markdown 代码块或解释文字。\n"
+            "4. 初始生成阶段对用户给出的文本过滤值使用精确等值 `=`，不要主动使用 LIKE、通配符 `%` 或 OR 放宽匹配。\n"
+            "5. 结果存在重复值时，优先考虑 DISTINCT。\n"
+            "6. 只输出 JSON，不要输出 Markdown 代码块或解释文字。\n"
         )
 
     @staticmethod
@@ -184,7 +185,7 @@ class SQLGenerator:
         highlighted_question = self.highlight_question_for_prompt(question)
         diversity_rule = (
             "多候选要求：每条 SQL 必须对应用户问题中的明确查询意图；可以在 SELECT、DISTINCT、"
-            "聚合或宽松匹配方式上做合理差异，但不得为了覆盖候选字段而遍历生成无问题依据的 SELECT/WHERE。"
+            "聚合表达方式上做合理差异，但不得为了覆盖候选字段而遍历生成无问题依据的 SELECT/WHERE。"
         )
         aggregation_rule = aggregation_rule_text()
         prompt_prefix = "# Role\n你是一名 SQL 专家。请只基于给定 Schema 生成 SQLite SQL。\n\n" + fewshot_block

@@ -206,9 +206,13 @@ def parse_batch_judge_response(text: str) -> list[dict]:
     return parsed
 
 
-def _format_batch_candidates(candidates: list[dict]) -> str:
+def _format_batch_candidates(
+    candidates: list[dict],
+    indices: list[int] | None = None,
+) -> str:
     lines: list[str] = []
-    for idx, cand in enumerate(candidates):
+    candidate_indices = indices or list(range(len(candidates)))
+    for idx, cand in zip(candidate_indices, candidates):
         lines.append(f"候选 {idx}")
         path_text = f"type={cand.get('type', '')}, variant={cand.get('variant_id', '')}".strip()
         if path_text:
@@ -243,48 +247,93 @@ async def judge_sql_batch_consistency(
     """批量判断同题 SQL 是否语义正确；只给错误 SQL 返回原因。"""
     if not candidates:
         return []
-
-    prompt = (
-        "你是 SQL 语义审查员。请逐条判断候选 SQL 是否忠实回答用户问题。\n"
-        "审查时使用与 SQL 生成相同的 Schema、用户问题和聚合规则，但你的任务不是生成 SQL，而是判断正误。\n\n"
-        f"[Schema]\n{schema_prompt}\n\n"
-        f"[用户问题]\n{question}\n\n"
-        f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
-        f"[聚合规则]\n{aggregation_rule_text()}\n\n"
-        f"[候选SQL]\n{_format_batch_candidates(candidates)}\n\n"
-        "判断要点：\n"
-        "1. WHERE/HAVING 条件、过滤值、项目名、订单号、物料编码等必须来自用户问题原文。\n"
-        "2. SELECT 目标必须能回答用户问的对象；问供应商就查供应商，问物料类别就查类别。\n"
-        "3. 聚合函数必须遵循聚合规则，个数问题用 COUNT，明确求和问题才用 SUM。\n"
-        "4. JOIN、GROUP BY、DISTINCT、非空过滤不能改变用户问题语义。\n"
-        "5. SQL 有执行错误时直接判 fail，并在原因中简要说明。\n"
-        "输出三态 status：pass=可直接采用；suspicious=能执行但可能过宽/过窄，仅降权；fail=高置信错误，可进入修复。\n"
-        "只输出 JSON：{\"items\":[{\"index\":0,\"status\":\"pass\",\"correct\":true},{\"index\":1,\"status\":\"suspicious\",\"correct\":false,\"reason\":\"...\"},{\"index\":2,\"status\":\"fail\",\"correct\":false,\"reason\":\"...\"}]}。\n"
-        "pass 不要填写 reason；suspicious/fail 必须填写 reason。"
-    )
     extra_body: dict = {}
     if getattr(settings, "evidence_use_guided_json", False):
         extra_body["guided_json"] = _BATCH_JUDGE_SCHEMA
     if not getattr(settings, "enable_thinking_for_entity", True):
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
 
-    try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=512,
-            timeout=settings.llm_request_timeout_sec,
-            extra_body=extra_body or None,
+
+    async def _judge_subset(indexed_candidates: list[tuple[int, dict]]) -> list[dict]:
+        indices = [idx for idx, _cand in indexed_candidates]
+        subset = [cand for _idx, cand in indexed_candidates]
+        output_example = {
+            "items": [
+                {"index": idx, "status": "pass", "correct": True}
+                for idx in indices
+            ]
+        }
+        prompt = (
+            "你是 SQL 语义审查员。请逐条判断候选 SQL 是否忠实回答用户问题。\n"
+            "审查时使用与 SQL 生成相同的 Schema、用户问题和聚合规则，但你的任务不是生成 SQL，而是判断正误。\n\n"
+            f"[Schema]\n{schema_prompt}\n\n"
+            f"[用户问题]\n{question}\n\n"
+            f"[弱意图解析]\n{json.dumps(intent_plan or {}, ensure_ascii=False)}\n\n"
+            f"[聚合规则]\n{aggregation_rule_text()}\n\n"
+            f"[候选SQL]\n{_format_batch_candidates(subset, indices)}\n\n"
+            "判断要点：\n"
+            "1. WHERE/HAVING 条件、过滤值、项目名、订单号、物料编码等必须来自用户问题原文。\n"
+            "2. SELECT 目标必须能回答用户问的对象；问供应商就查供应商，问物料类别就查类别。\n"
+            "3. 聚合函数必须遵循聚合规则，个数问题用 COUNT，明确求和问题才用 SUM。\n"
+            "4. JOIN、GROUP BY、DISTINCT、非空过滤不能改变用户问题语义。\n"
+            "5. SQL 有执行错误时直接判 fail，并在原因中简要说明。\n"
+            "6. 初始候选使用精确等值 `=`。若 exact_exists=false 且 candidate_values 非空，"
+            "优先建议使用规范值并继续保持 `=`；只有 like_exists=true 且目标列是名称或描述类文本字段时，"
+            "才能建议 `LIKE '%原值%'`。订单号、编码、编号等精确标识不得建议 LIKE。"
+            "仅凭空结果不能建议放宽，证据不足时判 suspicious。\n"
+            "7. 弱意图解析只是参考；若它与用户问题、Schema 或 SQL 实际字段冲突，以后三者为准。\n"
+            "输出三态 status：pass=可直接采用；suspicious=能执行但可能过宽/过窄，仅降权；fail=高置信错误，可进入修复。\n"
+            f"必须为索引 {indices} 中的每个候选各返回且只返回一项，不得遗漏索引。\n"
+            f"只输出同样结构的 JSON，例如：{json.dumps(output_example, ensure_ascii=False)}。\n"
+            "pass 不要填写 reason；suspicious/fail 必须填写 reason。"
         )
-        if tracker:
-            tracker.track(resp)
-        items = parse_batch_judge_response(resp.choices[0].message.content or "")
-        debug_print(f"[ConsistencyJudge][batch] items={items}")
-        return items
-    except Exception as exc:
-        debug_print(f"[ConsistencyJudge][batch] skipped: {type(exc).__name__}: {exc}")
-        return []
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=512,
+                timeout=settings.llm_request_timeout_sec,
+                extra_body=extra_body or None,
+            )
+            if tracker:
+                tracker.track(resp)
+            expected = set(indices)
+            parsed = parse_batch_judge_response(resp.choices[0].message.content or "")
+            unique: dict[int, dict] = {}
+            for item in parsed:
+                idx = item.get("index")
+                if idx in expected and idx not in unique:
+                    unique[idx] = item
+            return list(unique.values())
+        except Exception as exc:
+            debug_print(f"[ConsistencyJudge][batch] skipped: {type(exc).__name__}: {exc}")
+            return []
+
+    indexed = list(enumerate(candidates))
+    item_by_index: dict[int, dict] = {}
+    batch_size = 4
+    for start in range(0, len(indexed), batch_size):
+        for item in await _judge_subset(indexed[start : start + batch_size]):
+            item_by_index[item["index"]] = item
+
+    missing = [(idx, cand) for idx, cand in indexed if idx not in item_by_index]
+    for idx, cand in missing:
+        retried = await _judge_subset([(idx, cand)])
+        if retried:
+            item_by_index[idx] = retried[0]
+        else:
+            item_by_index[idx] = {
+                "index": idx,
+                "correct": False,
+                "status": "suspicious",
+                "reason": "judge_output_missing",
+                "risk": 1,
+            }
+
+    items = [item_by_index[idx] for idx in range(len(candidates))]
+    debug_print(f"[ConsistencyJudge][batch] items={items}")
+    return items
 
 
 async def judge_sql_consistency(

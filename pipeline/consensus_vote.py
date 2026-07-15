@@ -50,6 +50,7 @@ def _row_count(candidate: dict) -> int:
 def build_value_link_probe(
     candidate: dict,
     literal_exists: Callable[[str, str], bool] | None = None,
+    literal_probe: Callable[[str, str], dict] | None = None,
 ) -> dict:
     sql = str(candidate.get("sql") or "")
     if not sql:
@@ -82,10 +83,24 @@ def build_value_link_probe(
     for item in conditions:
         if len(item["literal"].strip("%_")) >= 4:
             literals_by_column[item["column"]].append(item["literal"])
-        if item["operator"] != "=" or not item["literal"] or literal_exists is None:
+        if item["operator"] != "=" or not item["literal"]:
             continue
-        exists = bool(literal_exists(item["column"], item["literal"]))
-        literal_checks.append({**item, "exists": exists})
+        probe = literal_probe(item["column"], item["literal"]) if literal_probe else {}
+        exists = bool(
+            probe.get("exact_exists")
+            if probe
+            else literal_exists(item["column"], item["literal"])
+            if literal_exists
+            else True
+        )
+        literal_checks.append(
+            {
+                **item,
+                "exists": exists,
+                "like_exists": bool(probe.get("like_exists")),
+                "candidate_values": list(probe.get("candidate_values") or []),
+            }
+        )
         if not exists:
             reasons.append(f"literal_not_found:{item['column']}={item['literal']}")
 
@@ -105,8 +120,9 @@ def build_value_link_probe(
 def annotate_candidate_risk(
     candidate: dict,
     literal_exists: Callable[[str, str], bool] | None = None,
+    literal_probe: Callable[[str, str], dict] | None = None,
 ) -> dict:
-    probe = build_value_link_probe(candidate, literal_exists)
+    probe = build_value_link_probe(candidate, literal_exists, literal_probe)
     candidate["value_link_probe"] = probe
     candidate["value_link_risk"] = probe["risk"]
     return candidate
@@ -139,7 +155,6 @@ def _sort_key(candidate: dict, group_sizes: dict[tuple, int]) -> tuple:
         0 if candidate.get("status") == "success" else 1,
         _candidate_risk(candidate),
         0 if _non_empty(candidate) else 1,
-        _row_count(candidate),
         -group_sizes.get(result_key, 1),
         1 if candidate.get("is_refined") else 0,
         _route_priority(candidate),

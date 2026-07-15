@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+
 from openai import AsyncOpenAI
 
 from config.settings import settings
@@ -7,6 +10,50 @@ from pipeline.consensus_vote import annotate_candidate_risk
 from pipeline.db_engine import DBEngine
 from pipeline.generator import SQLGenerator
 from pipeline.utils import TokenTracker
+
+
+_TEXT_CONDITION_RE = re.compile(
+    r'(?:(?:"(?P<quoted_col>[^"]+)")|(?P<plain_col>[A-Za-z_][\w]*))'
+    r"\s*(?P<operator>=|LIKE)\s*'(?P<literal>(?:''|[^'])*)'",
+    re.IGNORECASE,
+)
+_EXACT_IDENTIFIER_MARKERS = ("编码", "编号", "单号", "订单号")
+
+
+def _allows_new_like(candidate: dict, proposed_sql: str, judge_suggestion: str) -> bool:
+    source_sql = str(candidate.get("sql") or "")
+    source_likes = {
+        (match.group("quoted_col") or match.group("plain_col") or "", match.group("literal"))
+        for match in _TEXT_CONDITION_RE.finditer(source_sql)
+        if match.group("operator").upper() == "LIKE"
+    }
+    proposed_likes = [
+        (
+            match.group("quoted_col") or match.group("plain_col") or "",
+            match.group("literal").replace("''", "'").strip("%_"),
+        )
+        for match in _TEXT_CONDITION_RE.finditer(proposed_sql)
+        if match.group("operator").upper() == "LIKE"
+        and (match.group("quoted_col") or match.group("plain_col") or "", match.group("literal"))
+        not in source_likes
+    ]
+    if not proposed_likes:
+        return True
+    if "LIKE" not in str(judge_suggestion or "").upper():
+        return False
+
+    checks = (candidate.get("value_link_probe") or {}).get("literal_checks", [])
+    for column, literal in proposed_likes:
+        if any(marker in column for marker in _EXACT_IDENTIFIER_MARKERS):
+            return False
+        if not any(
+            check.get("column") == column
+            and str(check.get("literal") or "").strip("%_") == literal
+            and bool(check.get("like_exists"))
+            for check in checks
+        ):
+            return False
+    return True
 
 
 class SQLRefiner:
@@ -31,6 +78,7 @@ class SQLRefiner:
         refined = []
         failure_order = 0
         literal_exists = getattr(self.db, "check_literal_in_column", None)
+        literal_probe = getattr(self.db, "probe_literal_in_column", None)
         for cand in candidates:
             repaired = dict(cand)
             result, error = self.db.execute_sql(repaired["sql"])
@@ -56,7 +104,7 @@ class SQLRefiner:
             else:
                 repaired["status"] = "success"
                 repaired["result"] = result if result is not None else []
-            annotate_candidate_risk(repaired, literal_exists)
+            annotate_candidate_risk(repaired, literal_exists, literal_probe)
             refined.append(repaired)
 
         max_rounds = max(1, int(max_retries or settings.max_repair_retries))
@@ -66,7 +114,7 @@ class SQLRefiner:
             judge_debug = {
                 "ran": False,
                 "round": round_no,
-                "schema": "cliff",
+                "schema": "generation",
                 "items": [],
                 "candidate_sqls": [
                     {
@@ -168,7 +216,7 @@ class SQLRefiner:
                 if round_no == 1
                 else repair_schema_prompt or schema_prompt
             )
-            repair_schema_name = "cliff" if round_no == 1 else "topk"
+            repair_schema_name = "generation" if round_no == 1 else "repair"
             for target_index, target in targets:
                 target["_repair_attempted"] = True
                 sql_before = target.get("sql")
@@ -216,7 +264,7 @@ class SQLRefiner:
                     repaired["post_repair_judge_status"] = "suspicious"
                     repaired["post_repair_judge_risk"] = 1
                     repaired["post_repair_judge_reason"] = "repair_pending_rejudge"
-                annotate_candidate_risk(repaired, literal_exists)
+                annotate_candidate_risk(repaired, literal_exists, literal_probe)
                 if repaired.get("status") != "success":
                     failure_order += 1
                     repaired["failure_order"] = failure_order
@@ -265,14 +313,19 @@ class SQLRefiner:
             f"[错误SQL]\n{sql}\n"
             f"[错误原因]\n{candidate.get('error_msg', '')}\n"
             f"[Judge修改建议]\n{judge_suggestion or '无'}\n"
+            f"[数据库字面量证据]\n{json.dumps(candidate.get('value_link_probe') or {}, ensure_ascii=False)}\n"
             "要求：只输出可执行SQL，用```sql包裹。"
         )
         prompt += (
             "\n[最小修改原则]\n"
             "1. 只围绕错误原因修复，不要额外添加用户问题没有要求的过滤条件。\n"
             "2. WHERE/HAVING 中的编号、单号、名称等过滤值必须来自用户问题原文或错误原因中明确指出的原文条件。\n"
-            "3. 不得使用 Schema 示例值、枚举值或其它候选值替换用户原文条件。\n"
-            "4. 如果错误是空结果，优先放宽过严条件，不要替换用户给出的编号或单号。\n"
+            "3. 不得使用 Schema 示例值或枚举值替换用户原文；只有数据库字面量证据中的 candidate_values "
+            "可作为规范实体值，并继续使用精确等值 `=`。\n"
+            "4. 空结果本身不能触发模糊匹配；默认保留精确等值 `=`。\n"
+            "5. 只有 Judge 明确建议放宽，且对应字面量证据为 like_exists=true 时，"
+            "才把名称或描述类文本条件改为 `LIKE '%原值%'`；"
+            "必须保留用户原始字面量，订单号、编码、编号等精确标识始终使用 `=`。\n"
         )
         try:
             resp = await self.client.chat.completions.create(
@@ -286,6 +339,8 @@ class SQLRefiner:
             tracker.track(resp)
             content = resp.choices[0].message.content or ""
             sql2 = SQLGenerator.extract_sql(content)
+            if sql2 and not _allows_new_like(candidate, sql2, judge_suggestion):
+                sql2 = sql
             candidate["sql"] = sql2 or sql
             result, error = self.db.execute_sql(candidate["sql"])
             candidate["execution_error"] = error

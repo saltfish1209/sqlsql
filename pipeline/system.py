@@ -94,7 +94,6 @@ class TextToSQLSystem:
         confidence = float(candidate_pack.Top20候选[0]["相关性分数"]) if candidate_pack.Top20候选 else 0.0
         for cand in candidates:
             cand["confidence"] = confidence
-        cliff_schema_prompt = stages.get("cliff_schema_prompt") or schema_prompt
         refined = await self.refiner.refine_async(
             schema_prompt,
             candidates,
@@ -102,7 +101,7 @@ class TextToSQLSystem:
             tracker,
             repair_schema_prompt=repair_schema_prompt,
             question=question,
-            judge_schema_prompt=cliff_schema_prompt,
+            judge_schema_prompt=schema_prompt,
             intent_plan=intent_plan,
         )
         selected, reason, status = select_by_consensus(refined)
@@ -441,7 +440,7 @@ if __name__ == "__main__":
                 tracker,
                 repair_schema_prompt=repair_schema_prompt,
                 question=stages["question"],
-                judge_schema_prompt=stages.get("cliff_schema_prompt") or schema_prompt,
+                judge_schema_prompt=schema_prompt,
                 intent_plan=stages.get("intent_plan"),
             )
 

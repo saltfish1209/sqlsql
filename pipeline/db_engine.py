@@ -73,6 +73,48 @@ class DBEngine:
         except Exception:
             return False
 
+    def probe_literal_in_column(self, column: str, literal: str, limit: int = 3) -> dict:
+        """返回字面量在目标列中的精确、LIKE 与规范值证据。"""
+        exact_exists = self.check_literal_in_column(column, literal)
+        if exact_exists:
+            return {
+                "exact_exists": True,
+                "like_exists": False,
+                "candidate_values": [literal],
+            }
+
+        try:
+            quoted_column = str(column).replace('"', '""')
+            quoted_table = str(self.table_name).replace('"', '""')
+            self.cursor.execute(
+                f'SELECT DISTINCT "{quoted_column}" FROM "{quoted_table}" '
+                f'WHERE "{quoted_column}" LIKE ? LIMIT ?',
+                (f"%{literal}%", int(limit)),
+            )
+            like_values = [str(row[0]) for row in self.cursor.fetchall() if row[0] not in (None, "")]
+
+            self.cursor.execute(
+                f'SELECT DISTINCT "{quoted_column}" FROM "{quoted_table}" '
+                f'WHERE ? LIKE \'%\' || "{quoted_column}" || \'%\' '
+                f'AND length(trim("{quoted_column}")) >= 4 '
+                f'ORDER BY length("{quoted_column}") DESC LIMIT ?',
+                (literal, int(limit)),
+            )
+            contained_values = [
+                str(row[0]) for row in self.cursor.fetchall() if row[0] not in (None, "")
+            ]
+            return {
+                "exact_exists": False,
+                "like_exists": bool(like_values),
+                "candidate_values": list(dict.fromkeys(like_values + contained_values))[:limit],
+            }
+        except Exception:
+            return {
+                "exact_exists": False,
+                "like_exists": False,
+                "candidate_values": [],
+            }
+
     def get_column_distinct_values(self, column: str, limit: int = 20) -> list[str]:
         """获取某列的去重值样本，用于 Profiling。"""
         try:

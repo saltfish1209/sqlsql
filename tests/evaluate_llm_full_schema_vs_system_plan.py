@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import csv
 import json
 import os
@@ -16,6 +17,7 @@ _EVAL_DB_LOCK: threading.Lock | None = None
 _EVAL_RETRIEVE_LOCK: threading.Lock | None = None
 _LLM_SEMAPHORE: asyncio.Semaphore | None = None
 _PATH_PARALLEL: bool = True
+_FIXED_MAIN_CANDIDATES: dict[int, dict] = {}
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -174,6 +176,29 @@ def _default_eval_path() -> Path:
 
 def _default_ablation_detail_path(out_dir: Path) -> Path:
     return out_dir / "ablation_outputs.jsonl"
+
+
+def _load_fixed_main_candidates(path: Path) -> None:
+    """从已保存的主系统明细恢复固定候选，供无 Judge/Refiner 消融复用。"""
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("prefix") != "main_system" or row.get("idx") in (None, ""):
+                continue
+            candidates = row.get("generated_candidates") or []
+            if not candidates:
+                continue
+            _FIXED_MAIN_CANDIDATES[int(row["idx"])] = {
+                "question": str(row.get("question") or ""),
+                "candidates": candidates,
+                "generation_time_seconds": float(row.get("generation_time_seconds") or 0.0),
+                "generation_token_usage": row.get("generation_token_usage") or {},
+            }
 
 
 def _load_eval_df(path: str | os.PathLike[str] | Path | None = None) -> list[dict]:
@@ -354,6 +379,222 @@ def _append_jsonl_rows(path: Path, rows: list[dict]) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+def _write_jsonl_rows(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8", newline="\n") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    temp_path.replace(path)
+
+
+def _read_jsonl_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _rescore_detail_record(
+    detail: dict,
+    execute_sql: Callable[[str], tuple[list | None, str | None]],
+) -> dict | None:
+    prefix = str(detail.get("prefix") or "").strip()
+    raw_gt = detail.get("ground_truth_raw")
+    if not prefix or raw_gt is None:
+        return None
+
+    candidates: list[dict] = []
+    candidate_records = detail.get("refined_candidates") or detail.get("candidate_sqls") or []
+    for record in candidate_records:
+        candidate = dict(record)
+        sql = str(candidate.get("sql") or candidate.get("sql_after") or "").strip()
+        result, error = execute_sql(sql)
+        candidate.update(
+            {
+                "sql": sql,
+                "result": result if error is None else None,
+                "execution_error": error,
+                "status": "success" if error is None else "failed",
+            }
+        )
+        ok, match_type = _candidate_match(raw_gt, candidate)
+        record.update(
+            {
+                "execution_error": error,
+                "status": candidate["status"],
+                "result_preview": _preview_result(candidate.get("result")),
+                "candidate_correct": ok,
+                "candidate_match_type": match_type,
+            }
+        )
+        candidates.append(candidate)
+
+    selected_record = detail.get("selected_candidate") or {}
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("sql") == selected_record.get("sql")
+            and candidate.get("type") == selected_record.get("type")
+            and candidate.get("variant_id") == selected_record.get("variant_id")
+            and bool(candidate.get("is_refined")) == bool(selected_record.get("is_refined"))
+        ),
+        None,
+    )
+    final_result, final_error = execute_sql(str(detail.get("final_sql") or "").strip())
+    output = {
+        "execution_result": final_result if final_error is None else None,
+        "_candidate_pool": candidates,
+        "_selected_candidate": selected or {},
+    }
+    correct, match_type = _compare_output(raw_gt, output)
+    mechanism = _mechanism_metrics(raw_gt, output)
+    detail.update(
+        {
+            "correct": correct,
+            "match_type": match_type,
+            "final_result": output["execution_result"],
+            "final_execution_error": final_error,
+            "final_result_parsed": _normalize_eval_execution_result(output["execution_result"]),
+            "candidate_pool_has_correct_sql": bool(mechanism["pass_at_k"]),
+            **mechanism,
+        }
+    )
+    if isinstance(selected_record, dict) and selected:
+        selected_ok, selected_match_type = _candidate_match(raw_gt, selected)
+        selected_record.update(
+            {
+                "candidate_correct": selected_ok,
+                "candidate_match_type": selected_match_type,
+            }
+        )
+    for index, record in enumerate(detail.get("candidate_results") or []):
+        if index >= len(candidates):
+            break
+        candidate_ok, candidate_match_type = _candidate_match(raw_gt, candidates[index])
+        record.update(
+            {
+                "candidate_correct": candidate_ok,
+                "candidate_match_type": candidate_match_type,
+            }
+        )
+
+    return {
+        "idx": detail.get("idx"),
+        f"{prefix}_correct": int(correct),
+        f"{prefix}_time_seconds": float(detail.get("cost_time") or 0.0),
+        f"{prefix}_total_tokens": _tokens(detail.get("token_usage"))[2],
+        f"{prefix}_pass_at_k": mechanism["pass_at_k"],
+        f"{prefix}_selected_changed_by_refiner": mechanism["selected_changed_by_refiner"],
+        f"{prefix}_judge_trigger_count": mechanism["judge_trigger_count"],
+        f"{prefix}_repair_success_count": mechanism["repair_success_count"],
+        f"{prefix}_repair_harm_count": mechanism["repair_harm_count"],
+        "__detail__": detail,
+    }
+
+
+def _build_rescored_ablation_summary(
+    metric_rows_by_prefix: dict[str, list[dict]],
+    existing_summary: dict[str, dict],
+) -> tuple[list[dict], dict[str, dict]]:
+    summary_rows: list[dict] = []
+    extra_records: dict[str, dict] = {}
+    for label, prefix, _recall_key in ABLATION_CONFIGS:
+        rows = metric_rows_by_prefix.get(prefix) or []
+        if not rows:
+            continue
+        correct = _sum_int(rows, f"{prefix}_correct")
+        old = existing_summary.get(label) or {}
+        summary_rows.append(
+            {
+                "方案": label,
+                "准确率": round(correct / len(rows), 6),
+                "正确题数(总题数)": f"{correct}({len(rows)})",
+                "花费时间": _avg(rows, f"{prefix}_time_seconds"),
+                "tokens平均消耗": _avg(rows, f"{prefix}_total_tokens"),
+                "recall": old.get("recall", ""),
+                "Pass@K": _avg(rows, f"{prefix}_pass_at_k"),
+                "selected_changed_by_refiner": _sum_int(
+                    rows, f"{prefix}_selected_changed_by_refiner"
+                ),
+                "judge_trigger_count": _sum_int(rows, f"{prefix}_judge_trigger_count"),
+                "repair_success_count": _sum_int(rows, f"{prefix}_repair_success_count"),
+                "repair_harm_count": _sum_int(rows, f"{prefix}_repair_harm_count"),
+            }
+        )
+        extra_records[prefix] = _correct_idx_record(label=label, prefix=prefix, rows=rows)
+    return summary_rows, extra_records
+
+
+def _rescore_ablation_artifacts(
+    *,
+    detail_path: Path,
+    summary_path: Path,
+    extra_correct_path: Path,
+) -> dict:
+    """不重新调用模型，执行候选 SQL 并用当前比较器重建消融结果。"""
+    from pipeline.db_engine import DBEngine
+
+    detail_rows = _read_jsonl_rows(detail_path)
+    if not detail_rows:
+        raise FileNotFoundError(f"没有可重算的消融明细: {detail_path}")
+
+    db = DBEngine(str(settings.csv_path), settings.table_name)
+    metric_rows_by_prefix: dict[str, list[dict]] = {}
+    rewritten: list[dict] = []
+    execution_cache: dict[str, tuple[list | None, str | None]] = {}
+
+    def _execute(sql: str) -> tuple[list | None, str | None]:
+        if not sql:
+            return None, "EMPTY_SQL"
+        if sql not in execution_cache:
+            execution_cache[sql] = db.execute_sql(sql)
+        return execution_cache[sql]
+
+    try:
+        for detail in detail_rows:
+            metric_row = _rescore_detail_record(detail, _execute)
+            if metric_row:
+                prefix = str(detail.get("prefix") or "").strip()
+                metric_rows_by_prefix.setdefault(prefix, []).append(metric_row)
+            rewritten.append(detail)
+    finally:
+        db.close()
+
+    existing_summary = {
+        str(row.get("方案") or ""): row for row in _read_csv_rows(summary_path)
+    }
+    summary_rows, extra_records = _build_rescored_ablation_summary(
+        metric_rows_by_prefix,
+        existing_summary,
+    )
+
+    _write_jsonl_rows(detail_path, rewritten)
+    _write_csv(summary_path, summary_rows, SUMMARY_FIELDNAMES)
+    _write_extra_correct_report(
+        extra_correct_path,
+        group_label="Ablation",
+        configs=ABLATION_CONFIGS,
+        records=extra_records,
+        total_questions=max((len(rows) for rows in metric_rows_by_prefix.values()), default=0),
+    )
+    return {
+        "detail_rows": len(rewritten),
+        "configs": len(summary_rows),
+        "unique_sql_count": len(execution_cache),
+        "summary": summary_rows,
+    }
 
 
 def _completed_labels(path: Path) -> set[str]:
@@ -711,7 +952,11 @@ def _prepare_candidate_for_vote(system, cand: dict) -> dict:
     else:
         prepared["status"] = "success"
         prepared["result"] = result if result is not None else []
-    annotate_candidate_risk(prepared, system.db_engine.check_literal_in_column)
+    annotate_candidate_risk(
+        prepared,
+        system.db_engine.check_literal_in_column,
+        getattr(system.db_engine, "probe_literal_in_column", None),
+    )
     return prepared
 
 
@@ -852,7 +1097,7 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
         tracker,
         repair_schema_prompt=repair_schema_prompt,
         question=stages["question"],
-        judge_schema_prompt=stages.get("cliff_schema_prompt") or schema_prompt,
+        judge_schema_prompt=schema_prompt,
         intent_plan=stages.get("intent_plan"),
     )
     selected, reason, status = select_by_consensus(refined)
@@ -1042,7 +1287,7 @@ async def _finalize_main_pipeline(
             tracker,
             repair_schema_prompt=repair_schema_prompt,
             question=question if not skip_judge else None,
-            judge_schema_prompt=cliff_schema_prompt,
+            judge_schema_prompt=schema_prompt,
             intent_plan=stages.get("intent_plan"),
         )
     selected, reason, status = select_by_consensus(candidates)
@@ -1078,6 +1323,68 @@ async def _finalize_main_pipeline(
         "stages": stages,
         **trace_fields,
     }
+
+
+async def _run_fixed_candidate_main_variant(
+    system,
+    *,
+    idx: int,
+    stages: dict,
+    reuse_candidates: bool,
+    skip_refiner: bool = False,
+    skip_judge: bool = False,
+) -> dict:
+    """主系统及其 Judge/Refiner 消融共享完全相同的原始候选 SQL。"""
+    tracker = TokenTracker()
+    generation_time = 0.0
+    generation_usage: dict = {}
+    cached = _FIXED_MAIN_CANDIDATES.get(idx) if reuse_candidates else None
+    if cached:
+        if str(cached.get("question") or "") != str(stages.get("question") or ""):
+            raise RuntimeError(f"固定候选与当前问题不匹配: idx={idx}")
+        cand = copy.deepcopy(cached["candidates"])
+        generation_time = float(cached.get("generation_time_seconds") or 0.0)
+        generation_usage = dict(cached.get("generation_token_usage") or {})
+        tracker.prompt_tokens = int(generation_usage.get("input_tokens") or 0)
+        tracker.completion_tokens = int(generation_usage.get("output_tokens") or 0)
+    elif reuse_candidates:
+        raise RuntimeError(f"缺少主系统固定候选，不能运行公平消融: idx={idx}")
+    else:
+        generation_start = time.time()
+        cand = await system.generator.generate_candidates_async(
+            stages["question"],
+            stages["schema_prompt"],
+            tracker,
+            intent_plan=stages.get("intent_plan"),
+        )
+        generation_time = time.time() - generation_start
+        generation_usage = tracker.get_report()
+        _FIXED_MAIN_CANDIDATES[idx] = {
+            "question": str(stages.get("question") or ""),
+            "candidates": copy.deepcopy(cand),
+            "generation_time_seconds": generation_time,
+            "generation_token_usage": generation_usage,
+        }
+
+    start = time.time() - generation_time
+    output = await _finalize_main_pipeline(
+        system,
+        question=stages["question"],
+        cand=copy.deepcopy(cand),
+        schema_prompt=stages["schema_prompt"],
+        repair_schema_prompt=stages["repair_schema_prompt"],
+        cliff_schema_prompt=stages["schema_prompt"],
+        candidate_pack=stages["candidate_pack"],
+        tracker=tracker,
+        start=start,
+        stages=stages,
+        skip_refiner=skip_refiner,
+        skip_judge=skip_judge,
+    )
+    output["generation_time_seconds"] = round(generation_time, 6)
+    output["generation_token_usage"] = generation_usage
+    output["fixed_candidate_replay"] = bool(cached)
+    return output
 
 
 async def _run_main_system_once(system, question: str, *, stages: dict | None = None) -> dict:
@@ -1355,6 +1662,9 @@ def _build_main_system_detail_record(
         "reason": output.get("reason"),
         "cost_time": output.get("cost_time"),
         "token_usage": output.get("token_usage") or {},
+        "generation_time_seconds": output.get("generation_time_seconds"),
+        "generation_token_usage": output.get("generation_token_usage") or {},
+        "fixed_candidate_replay": bool(output.get("fixed_candidate_replay")),
         "candidate_sqls": output.get("candidate_sqls") or [],
         **trace_fields,
         "intent_plan": output.get("intent_plan") or stages.get("intent_plan") or {},
@@ -1388,6 +1698,9 @@ def _build_experiment_detail_record(
         "reason": output.get("reason"),
         "cost_time": output.get("cost_time"),
         "token_usage": output.get("token_usage") or {},
+        "generation_time_seconds": output.get("generation_time_seconds"),
+        "generation_token_usage": output.get("generation_token_usage") or {},
+        "fixed_candidate_replay": bool(output.get("fixed_candidate_replay")),
         "candidate_sqls": output.get("candidate_sqls") or [],
         **trace_fields,
     }
@@ -1693,7 +2006,12 @@ async def _run_ablation_config_one(
         recall_schema = full_schema_row_list
     elif prefix == "main_system":
         stages = await _prepare_single_pipeline_async(system, question)
-        output = await _run_main_system_once(system, question, stages=stages)
+        output = await _run_fixed_candidate_main_variant(
+            system,
+            idx=idx,
+            stages=stages,
+            reuse_candidates=False,
+        )
         recall_schema = stages.get("plan_schema") or []
     elif prefix == "main_topk_schema":
         stages = await _prepare_single_pipeline_async(system, question)
@@ -1725,14 +2043,26 @@ async def _run_ablation_config_one(
         recall_schema = stages.get("plan_schema") or []
     elif prefix == "main_no_refiner":
         stages = await _prepare_single_pipeline_async(system, question)
-        output = await _run_main_no_refiner_once(system, question, stages=stages)
+        output = await _run_fixed_candidate_main_variant(
+            system,
+            idx=idx,
+            stages=stages,
+            reuse_candidates=True,
+            skip_refiner=True,
+        )
         recall_schema = stages.get("plan_schema") or []
     elif prefix == "main_no_entity":
         output = await _run_main_no_entity_once(system, question)
         recall_schema = (output.get("stages") or {}).get("plan_schema") or []
     elif prefix == "main_no_judge":
         stages = await _prepare_single_pipeline_async(system, question)
-        output = await _run_main_no_judge_once(system, question, stages=stages)
+        output = await _run_fixed_candidate_main_variant(
+            system,
+            idx=idx,
+            stages=stages,
+            reuse_candidates=True,
+            skip_judge=True,
+        )
         recall_schema = stages.get("plan_schema") or []
     else:
         raise ValueError(f"unsupported ablation config: {prefix}")
@@ -1888,8 +2218,6 @@ async def _run_config_group_with_resume(
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    from pipeline.system import TextToSQLSystem
-
     mode = str(args.mode or "both").strip().lower()
     if mode not in {"1", "2", "both"}:
         raise ValueError(f"unsupported --mode: {args.mode}")
@@ -1921,6 +2249,19 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     schema_extra_correct_path = out_dir / "schema_compare_extra_correct.json"
     ablation_extra_correct_path = out_dir / "ablation_extra_correct.json"
+    if args.rescore_existing:
+        if mode not in {"2", "both"}:
+            raise ValueError("--rescore-existing 目前用于模式2消融明细，请设置 --mode 2")
+        report = _rescore_ablation_artifacts(
+            detail_path=ablation_detail_path,
+            summary_path=ablation_path,
+            extra_correct_path=ablation_extra_correct_path,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+
+    from pipeline.system import TextToSQLSystem
+
     if args.overwrite:
         if mode in {"1", "both"} and schema_compare_path.exists():
             schema_compare_path.unlink()
@@ -1940,6 +2281,10 @@ async def main_async(args: argparse.Namespace) -> None:
         if mode in {"2", "both"} and ablation_detail_path.exists():
             ablation_detail_path.unlink()
             print(f"[Overwrite] removed: {ablation_detail_path}")
+
+    _FIXED_MAIN_CANDIDATES.clear()
+    if mode in {"2", "both"} and not args.overwrite:
+        _load_fixed_main_candidates(ablation_detail_path)
 
     global _PATH_PARALLEL
     _PATH_PARALLEL = not bool(args.no_path_parallel)
@@ -2052,6 +2397,11 @@ def main() -> None:
         "--overwrite",
         action="store_true",
         help="覆盖已有汇总 CSV；默认续写并跳过已完成的对比实验",
+    )
+    parser.add_argument(
+        "--rescore-existing",
+        action="store_true",
+        help="不调用模型，重新执行现有消融明细中的候选 SQL，并用当前比较器重建汇总",
     )
     parser.add_argument("--limit", type=int, default=0, help="仅评测前 N 条，0 表示全部")
     parser.add_argument(
