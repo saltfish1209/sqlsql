@@ -1,41 +1,31 @@
 from __future__ import annotations
 
 import json
-import re
 
 from openai import AsyncOpenAI
 
 from config.settings import settings
 from pipeline.consensus_vote import annotate_candidate_risk
 from pipeline.db_engine import DBEngine
+from pipeline.evidence_resolver import EvidenceResolver, extract_text_conditions
 from pipeline.generator import SQLGenerator
 from pipeline.utils import TokenTracker
 
-
-_TEXT_CONDITION_RE = re.compile(
-    r'(?:(?:"(?P<quoted_col>[^"]+)")|(?P<plain_col>[A-Za-z_][\w]*))'
-    r"\s*(?P<operator>=|LIKE)\s*'(?P<literal>(?:''|[^'])*)'",
-    re.IGNORECASE,
-)
 _EXACT_IDENTIFIER_MARKERS = ("编码", "编号", "单号", "订单号")
 
 
 def _allows_new_like(candidate: dict, proposed_sql: str, judge_suggestion: str) -> bool:
     source_sql = str(candidate.get("sql") or "")
     source_likes = {
-        (match.group("quoted_col") or match.group("plain_col") or "", match.group("literal"))
-        for match in _TEXT_CONDITION_RE.finditer(source_sql)
-        if match.group("operator").upper() == "LIKE"
+        (item["column"], item["literal"])
+        for item in extract_text_conditions(source_sql)
+        if item["operator"] == "LIKE"
     }
     proposed_likes = [
-        (
-            match.group("quoted_col") or match.group("plain_col") or "",
-            match.group("literal").replace("''", "'").strip("%_"),
-        )
-        for match in _TEXT_CONDITION_RE.finditer(proposed_sql)
-        if match.group("operator").upper() == "LIKE"
-        and (match.group("quoted_col") or match.group("plain_col") or "", match.group("literal"))
-        not in source_likes
+        (item["column"], item["literal"].strip("%_"))
+        for item in extract_text_conditions(proposed_sql)
+        if item["operator"] == "LIKE"
+        and (item["column"], item["literal"]) not in source_likes
     ]
     if not proposed_likes:
         return True
@@ -57,10 +47,17 @@ def _allows_new_like(candidate: dict, proposed_sql: str, judge_suggestion: str) 
 
 
 class SQLRefiner:
-    def __init__(self, client: AsyncOpenAI, model: str, db: DBEngine):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        db: DBEngine,
+        evidence_resolver: EvidenceResolver | None = None,
+    ):
         self.client = client
         self.model = model
         self.db = db
+        self.evidence_resolver = evidence_resolver
 
     async def refine_async(
         self,
@@ -74,11 +71,14 @@ class SQLRefiner:
         question: str | None = None,
         judge_schema_prompt: str | None = None,
         intent_plan: dict | None = None,
+        evidence_bundle: dict | None = None,
     ) -> list[dict]:
         refined = []
         failure_order = 0
         literal_exists = getattr(self.db, "check_literal_in_column", None)
         literal_probe = getattr(self.db, "probe_literal_in_column", None)
+        if self.evidence_resolver and evidence_bundle is None:
+            evidence_bundle = self.evidence_resolver.prepare(question or "", [], {})
         for cand in candidates:
             repaired = dict(cand)
             result, error = self.db.execute_sql(repaired["sql"])
@@ -104,6 +104,8 @@ class SQLRefiner:
             else:
                 repaired["status"] = "success"
                 repaired["result"] = result if result is not None else []
+            if self.evidence_resolver:
+                self.evidence_resolver.audit_candidate(repaired, evidence_bundle)
             annotate_candidate_risk(repaired, literal_exists, literal_probe)
             refined.append(repaired)
 
@@ -123,6 +125,7 @@ class SQLRefiner:
                         "variant_id": item.get("variant_id"),
                         "sql": item.get("sql"),
                         "error": item.get("execution_error") or "",
+                        "condition_evidence": item.get("condition_evidence") or {},
                         "value_link_probe": item.get("value_link_probe") or {},
                     }
                     for idx, item in enumerate(refined)
@@ -264,6 +267,8 @@ class SQLRefiner:
                     repaired["post_repair_judge_status"] = "suspicious"
                     repaired["post_repair_judge_risk"] = 1
                     repaired["post_repair_judge_reason"] = "repair_pending_rejudge"
+                if self.evidence_resolver:
+                    self.evidence_resolver.audit_candidate(repaired, evidence_bundle)
                 annotate_candidate_risk(repaired, literal_exists, literal_probe)
                 if repaired.get("status") != "success":
                     failure_order += 1

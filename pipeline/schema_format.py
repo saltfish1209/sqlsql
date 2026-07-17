@@ -109,7 +109,10 @@ def build_evidence_markdown(evidence: dict | None) -> str:
                     continue
                 value = str(hit.get("对应匹配值") or "").strip()
                 way = str(hit.get("匹配方式") or match_type or "").strip()
+                score = hit.get("相关性分数")
                 detail = f"{way}" + (f", 值={value}" if value else "")
+                if score not in (None, ""):
+                    detail += f", 分数={score}"
                 lines.append(f"- 实体「{entity}」→ 列「{col}」（{detail}）")
     return "\n".join(lines)
 

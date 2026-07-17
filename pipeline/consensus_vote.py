@@ -4,19 +4,14 @@ import re
 from collections import defaultdict
 from collections.abc import Callable
 
+from pipeline.evidence_resolver import extract_text_conditions
+
 
 _ROUTE_PRIORITY = {
     "direct": 0,
     "icl": 1,
     "intent_plan": 2,
 }
-
-_CONDITION_RE = re.compile(
-    r'(?:(?:"(?P<quoted_col>[^"]+)")|(?P<plain_col>[A-Za-z_][\w]*))'
-    r"\s*(?P<operator>=|LIKE)\s*'(?P<literal>(?:''|[^'])*)'",
-    re.IGNORECASE,
-)
-
 
 def _result_key(candidate: dict) -> tuple:
     rows = candidate.get("result") or []
@@ -58,15 +53,11 @@ def build_value_link_probe(
 
     where_match = re.search(r"\bWHERE\b(.+)", sql, flags=re.IGNORECASE | re.DOTALL)
     where_sql = where_match.group(1) if where_match else ""
-    conditions = []
-    for match in _CONDITION_RE.finditer(where_sql):
-        conditions.append(
-            {
-                "column": match.group("quoted_col") or match.group("plain_col") or "",
-                "operator": match.group("operator").upper(),
-                "literal": match.group("literal").replace("''", "'").strip(),
-            }
-        )
+    conditions = extract_text_conditions(sql)
+    audited_conditions = {
+        (item.get("column"), item.get("operator"), item.get("literal")): item
+        for item in (candidate.get("condition_evidence") or {}).get("conditions", [])
+    }
 
     reasons: list[str] = []
     literal_checks: list[dict] = []
@@ -81,11 +72,12 @@ def build_value_link_probe(
 
     literals_by_column: dict[str, list[str]] = defaultdict(list)
     for item in conditions:
+        audited = audited_conditions.get((item["column"], item["operator"], item["literal"])) or {}
         if len(item["literal"].strip("%_")) >= 4:
             literals_by_column[item["column"]].append(item["literal"])
         if item["operator"] != "=" or not item["literal"]:
             continue
-        probe = literal_probe(item["column"], item["literal"]) if literal_probe else {}
+        probe = audited or (literal_probe(item["column"], item["literal"]) if literal_probe else {})
         exists = bool(
             probe.get("exact_exists")
             if probe
@@ -99,10 +91,15 @@ def build_value_link_probe(
                 "exists": exists,
                 "like_exists": bool(probe.get("like_exists")),
                 "candidate_values": list(probe.get("candidate_values") or []),
+                "provenance": audited.get("provenance"),
+                "routes": audited.get("routes") or {},
+                "column_hits": audited.get("column_hits") or {},
             }
         )
         if not exists:
             reasons.append(f"literal_not_found:{item['column']}={item['literal']}")
+        if audited.get("provenance") == "generated_only":
+            reasons.append(f"generated_only_literal:{item['column']}={item['literal']}")
 
     if re.search(r"\b(?:AND|OR)\b", where_sql, flags=re.IGNORECASE):
         for column, literals in literals_by_column.items():

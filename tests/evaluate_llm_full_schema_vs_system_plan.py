@@ -940,7 +940,7 @@ def _prepare_main_no_entity_stages(system, question: str) -> dict:
     }
 
 
-def _prepare_candidate_for_vote(system, cand: dict) -> dict:
+def _prepare_candidate_for_vote(system, cand: dict, evidence_bundle: dict | None = None) -> dict:
     """无 refiner 时：执行 SQL 并补齐一致性投票所需的 status / result 字段。"""
     prepared = dict(cand)
     result, error = system.db_engine.execute_sql(prepared.get("sql") or "")
@@ -952,6 +952,9 @@ def _prepare_candidate_for_vote(system, cand: dict) -> dict:
     else:
         prepared["status"] = "success"
         prepared["result"] = result if result is not None else []
+    evidence_resolver = getattr(system, "evidence_resolver", None)
+    if evidence_resolver:
+        evidence_resolver.audit_candidate(prepared, evidence_bundle)
     annotate_candidate_risk(
         prepared,
         system.db_engine.check_literal_in_column,
@@ -994,6 +997,7 @@ def _candidate_path_record(candidate: dict) -> dict:
         "post_repair_judge_risk": candidate.get("post_repair_judge_risk"),
         "post_repair_judge_reason": candidate.get("post_repair_judge_reason"),
         "value_link_risk": candidate.get("value_link_risk"),
+        "condition_evidence": candidate.get("condition_evidence") or {},
         "value_link_probe": candidate.get("value_link_probe") or {},
         "is_refined": bool(candidate.get("is_refined")),
         "refined_from": candidate.get("refined_from"),
@@ -1099,6 +1103,7 @@ async def _run_main_no_entity_once(system, question: str) -> dict:
         question=stages["question"],
         judge_schema_prompt=schema_prompt,
         intent_plan=stages.get("intent_plan"),
+        evidence_bundle=stages.get("evidence_bundle"),
     )
     selected, reason, status = select_by_consensus(refined)
     if selected is None:
@@ -1167,7 +1172,9 @@ async def _run_main_no_refiner_once(system, question: str, *, stages: dict | Non
     prepared = []
     for cand in candidates:
         cand["confidence"] = confidence
-        prepared.append(_prepare_candidate_for_vote(system, cand))
+        prepared.append(
+            _prepare_candidate_for_vote(system, cand, stages.get("evidence_bundle"))
+        )
     selected, reason, status = select_by_consensus(prepared)
     if selected is None:
         trace_fields = _pipeline_trace_fields(candidates, prepared, None)
@@ -1278,7 +1285,10 @@ async def _finalize_main_pipeline(
     for item in generated_candidates:
         item["confidence"] = confidence
     if skip_refiner:
-        candidates = [_prepare_candidate_for_vote(system, item) for item in generated_candidates]
+        candidates = [
+            _prepare_candidate_for_vote(system, item, stages.get("evidence_bundle"))
+            for item in generated_candidates
+        ]
     else:
         candidates = await system.refiner.refine_async(
             schema_prompt,
@@ -1289,6 +1299,7 @@ async def _finalize_main_pipeline(
             question=question if not skip_judge else None,
             judge_schema_prompt=schema_prompt,
             intent_plan=stages.get("intent_plan"),
+            evidence_bundle=stages.get("evidence_bundle"),
         )
     selected, reason, status = select_by_consensus(candidates)
     if selected is None:

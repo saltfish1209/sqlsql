@@ -226,6 +226,10 @@ def _format_batch_candidates(
         else:
             lines.append("执行结果预览:")
             lines.append(_format_sql_result(cand.get("result"), limit=3))
+        condition_evidence = cand.get("condition_evidence") or {}
+        if condition_evidence.get("conditions"):
+            lines.append("SQL实际条件证据:")
+            lines.append(json.dumps(condition_evidence, ensure_ascii=False))
         probe = cand.get("value_link_probe") or {}
         if probe.get("reasons"):
             lines.append("事实风险信号:")
@@ -281,7 +285,10 @@ async def judge_sql_batch_consistency(
             "优先建议使用规范值并继续保持 `=`；只有 like_exists=true 且目标列是名称或描述类文本字段时，"
             "才能建议 `LIKE '%原值%'`。订单号、编码、编号等精确标识不得建议 LIKE。"
             "仅凭空结果不能建议放宽，证据不足时判 suspicious。\n"
-            "7. 弱意图解析只是参考；若它与用户问题、Schema 或 SQL 实际字段冲突，以后三者为准。\n"
+            "7. 条件 provenance=question_exact 表示值来自问题原文；pregen_candidate 仅表示生成前证据支持；"
+            "generated_only 表示值只由 SQL 引入，即使数据库存在也不能据此判定语义正确，应至少保持可疑。\n"
+            "8. 三路匹配分数是各检索路线内部的相关性，不是校准后的正确概率；只能作为弱证据。\n"
+            "9. 弱意图解析只是参考；若它与用户问题、Schema 或 SQL 实际字段冲突，以后三者为准。\n"
             "输出三态 status：pass=可直接采用；suspicious=能执行但可能过宽/过窄，仅降权；fail=高置信错误，可进入修复。\n"
             f"必须为索引 {indices} 中的每个候选各返回且只返回一项，不得遗漏索引。\n"
             f"只输出同样结构的 JSON，例如：{json.dumps(output_example, ensure_ascii=False)}。\n"

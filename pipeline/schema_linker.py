@@ -572,8 +572,58 @@ class SchemaLinker:
             if score <= 0:
                 continue
             meta = self.faiss_index_meta[idx]
-            out.append({"对应匹配值": meta["value"], "所在匹配列": meta["column"], "匹配方式": "向量匹配", "相关性分数": round(float(score), 4)})
+            out.append({"实体文本": keyword, "对应匹配值": meta["value"], "所在匹配列": meta["column"], "匹配方式": "向量匹配", "相关性分数": round(float(score), 4)})
         return self._dedupe_alignments(out)
+
+    def lookup_value_evidence(self, entity: str) -> dict[str, list[dict]]:
+        """对单个实体同时运行精确、模糊、向量三路值检索。"""
+        entity = str(entity or "").strip()
+        entity_norm = _normalize_text(entity)
+        evidence = {"精确匹配": [], "模糊匹配": [], "向量匹配": []}
+        if not entity_norm:
+            return evidence
+
+        exact_hits: list[dict] = []
+        for exact_key in dict.fromkeys([entity, to_halfwidth(entity), entity_norm]):
+            for column in self.exact_index.get(exact_key, set()):
+                exact_hits.append(
+                    {
+                        "实体文本": entity,
+                        "对应匹配值": entity,
+                        "所在匹配列": column,
+                        "匹配方式": "精确匹配",
+                        "相关性分数": 1.0,
+                    }
+                )
+        evidence["精确匹配"] = self._dedupe_alignments(exact_hits)
+
+        fuzzy_hits: list[dict] = []
+        for meta in self.column_metadata:
+            column = meta["column_name"]
+            for value in self._value_index.get(column, []):
+                value_norm = _normalize_text(value)
+                if not value_norm or value_norm == entity_norm:
+                    continue
+                seq = _safe_ratio(entity_norm, value_norm)
+                jac = _char_jaccard(entity_norm, value_norm)
+                score = 0.7 * seq + 0.3 * jac
+                if score >= settings.lsh_query_combined_threshold:
+                    fuzzy_hits.append(
+                        {
+                            "实体文本": entity,
+                            "对应匹配值": value,
+                            "所在匹配列": column,
+                            "匹配方式": "模糊匹配",
+                            "相关性分数": round(float(score), 4),
+                        }
+                    )
+        fuzzy_hits.extend(self._search_lsh_fuzzy_candidates(entity))
+        fuzzy_hits.sort(key=lambda item: float(item.get("相关性分数") or 0.0), reverse=True)
+        evidence["模糊匹配"] = self._dedupe_alignments(fuzzy_hits)
+
+        if settings.enable_semantic_value_retrieval and self.faiss_index is not None and self._is_text_query(entity):
+            evidence["向量匹配"] = self._search_faiss_semantic(entity)
+        return evidence
 
     def retrieve(self, question: str, extracted_entities: list[str] | list[dict] | None = None) -> CandidateSchemaPack:
         q = _normalize_text(question)
@@ -625,48 +675,12 @@ class SchemaLinker:
         }
         if settings.enable_entity_extraction:
             for ent in entities:
-                ent_norm = _normalize_text(ent)
-                if not ent_norm:
-                    continue
-                exact_hits: list[dict] = []
-                for exact_key in dict.fromkeys([ent, to_halfwidth(ent), ent_norm]):
-                    if exact_key not in self.exact_index:
+                entity_evidence = self.lookup_value_evidence(ent)
+                for route, hits in entity_evidence.items():
+                    if not hits:
                         continue
-                    for c in self.exact_index[exact_key]:
-                        exact_hits.append({"实体文本": ent, "对应匹配值": ent, "所在匹配列": c, "匹配方式": "精确匹配", "相关性分数": 1.0})
-                if exact_hits:
-                    deduped = self._dedupe_alignments(exact_hits)
-                    evidence["精确匹配"][ent] = deduped
-                    must_have.extend([x["所在匹配列"] for x in deduped])
-                    continue
-
-                fuzzy_candidates: list[dict] = []
-                for meta in self.column_metadata:
-                    col = meta["column_name"]
-                    for ex in list(self._value_index.get(col, [])[: settings.candidate_value_top_k]):
-                        ex_norm = _normalize_text(ex)
-                        if not ex_norm:
-                            continue
-                        if ex in self.exact_index or ex_norm in self.exact_index:
-                            continue
-                        seq = _safe_ratio(ent_norm, ex_norm)
-                        jac = _char_jaccard(ent_norm, ex_norm)
-                        combined = 0.7 * seq + 0.3 * jac
-                        if combined >= settings.lsh_query_combined_threshold:
-                            fuzzy_candidates.append({"实体文本": ent, "对应匹配值": ex, "所在匹配列": col, "匹配方式": "模糊匹配", "相关性分数": round(float(combined), 4)})
-                            break
-                lsh_hits = self._search_lsh_fuzzy_candidates(ent)
-                fuzzy_candidates.extend(lsh_hits)
-                if fuzzy_candidates:
-                    fuzzy_candidates = self._dedupe_alignments(fuzzy_candidates)
-                    evidence["模糊匹配"][ent] = fuzzy_candidates
-                    must_have.extend([x["所在匹配列"] for x in fuzzy_candidates])
-
-                if settings.enable_semantic_value_retrieval and self.faiss_index is not None and self._is_text_query(ent):
-                    sem_hits = self._search_faiss_semantic(ent)
-                    for hit in sem_hits:
-                        evidence["向量匹配"].setdefault(ent, []).append(hit)
-                        must_have.append(hit["所在匹配列"])
+                    evidence[route][ent] = hits
+                    must_have.extend(hit["所在匹配列"] for hit in hits)
 
         if exact_mentioned_columns:
             debug_print(f"[Schema][NameMatch] 问题中命中完整字段名，加入 must_have: {exact_mentioned_columns}")

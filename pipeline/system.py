@@ -8,6 +8,7 @@ import time
 from config.settings import settings
 from generation.multi_result_utils import MULTI_RESULT_SEP
 from pipeline.db_engine import DBEngine
+from pipeline.evidence_resolver import EvidenceResolver
 from pipeline.schema_linker import SchemaLinker
 from pipeline.entity_extractor import EntityExtractor
 from pipeline.generator import SQLGenerator
@@ -30,6 +31,7 @@ class TextToSQLSystem:
         self.llm_model = get_model_name()
         self.db_engine = DBEngine(csv_path, settings.table_name)
         self.linker = SchemaLinker(schema_path, csv_path)
+        self.evidence_resolver = EvidenceResolver(self.linker, self.db_engine)
         report = getattr(self.linker, "deprecated_columns_report", {}) or {}
         if report:
             deprecated = report.get("deprecated", {})
@@ -44,7 +46,12 @@ class TextToSQLSystem:
         self.intent_planner = IntentPlanner(self.client, self.llm_model)
         self.generator = SQLGenerator(self.client, self.llm_model)
         self.splitter = QuestionSplitter(self.client, self.llm_model)
-        self.refiner = SQLRefiner(self.client, self.llm_model, self.db_engine)
+        self.refiner = SQLRefiner(
+            self.client,
+            self.llm_model,
+            self.db_engine,
+            evidence_resolver=self.evidence_resolver,
+        )
         self.profiler = DatabaseProfiler(csv_path=csv_path)
         debug_print(">>> [System Init] 完成.\n")
 
@@ -69,6 +76,7 @@ class TextToSQLSystem:
         final_schema = stages["final_schema"]
         schema_prompt = stages["schema_prompt"]
         repair_schema_prompt = stages["repair_schema_prompt"]
+        evidence_bundle = stages["evidence_bundle"]
         intent_plan = stages.get("intent_plan") or {}
 
         candidates = await self.generator.generate_candidates_async(
@@ -103,6 +111,7 @@ class TextToSQLSystem:
             question=question,
             judge_schema_prompt=schema_prompt,
             intent_plan=intent_plan,
+            evidence_bundle=evidence_bundle,
         )
         selected, reason, status = select_by_consensus(refined)
         if selected is None:
@@ -116,10 +125,7 @@ class TextToSQLSystem:
                 "candidate_schema_pack": plan_schema,
                 "sql_generation_spec": schema_prompt,
                 "intent_plan": intent_plan,
-                "candidate_sqls": [
-                    {"type": c.get("type"), "variant_id": c.get("variant_id"), "sql": c.get("sql")}
-                    for c in refined
-                ],
+                "candidate_sqls": [self._candidate_trace(c) for c in refined],
                 "is_multi_question": False,
             }
 
@@ -149,10 +155,7 @@ class TextToSQLSystem:
             "候选字段包": plan_schema,
             "sql_generation_spec": schema_prompt,
             "intent_plan": intent_plan,
-            "candidate_sqls": [
-                {"type": c.get("type"), "variant_id": c.get("variant_id"), "sql": c.get("sql"), "status": c.get("status")}
-                for c in refined
-            ],
+            "candidate_sqls": [self._candidate_trace(c) for c in refined],
             "repair_schema": final_schema,
             "is_multi_question": False,
         }
@@ -176,6 +179,11 @@ class TextToSQLSystem:
                 schema_columns=self.linker.column_names,
             )
         candidate_pack = self.linker.retrieve(norm_question, entities)
+        evidence_bundle = self.evidence_resolver.prepare(
+            question,
+            entities,
+            candidate_pack.证据详情,
+        )
         plan_schema = self._assemble_plan_schema(candidate_pack)
         final_schema = self._assemble_final_schema(candidate_pack)
         cliff_schema = list(candidate_pack.精简schema or [])
@@ -193,6 +201,7 @@ class TextToSQLSystem:
             "norm_question": norm_question,
             "initial_pack": initial_pack,
             "candidate_pack": candidate_pack,
+            "evidence_bundle": evidence_bundle,
             "entities": entities,
             "intent_plan": intent_plan,
             "plan_schema": plan_schema,
@@ -223,6 +232,19 @@ class TextToSQLSystem:
             candidate_pack.证据详情,
             include_evidence=True,
         )
+
+    @staticmethod
+    def _candidate_trace(candidate: dict) -> dict:
+        return {
+            "type": candidate.get("type"),
+            "variant_id": candidate.get("variant_id"),
+            "sql": candidate.get("sql"),
+            "status": candidate.get("status"),
+            "judge_status": candidate.get("judge_status"),
+            "judge_risk": candidate.get("judge_risk"),
+            "condition_evidence": candidate.get("condition_evidence") or {},
+            "value_link_probe": candidate.get("value_link_probe") or {},
+        }
 
     async def _maybe_split_question(self, question: str, tracker: TokenTracker | None = None) -> list[str]:
         if not getattr(settings, "enable_question_split", True):
@@ -442,6 +464,7 @@ if __name__ == "__main__":
                 question=stages["question"],
                 judge_schema_prompt=schema_prompt,
                 intent_plan=stages.get("intent_plan"),
+                evidence_bundle=stages.get("evidence_bundle"),
             )
 
         selected, reason, status = select_by_consensus(refined) if refined else (None, "no_candidates", "failed")
